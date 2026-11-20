@@ -1,13 +1,17 @@
 
 package com.example.rakatcounter
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -17,9 +21,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -40,7 +41,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 enum class PrayerType(val title: String, val totalRakats: Int) {
     FAJR("نماز صبح", 2),
@@ -70,74 +72,60 @@ private fun ordinalPersian(num: Int): String = when (num) {
 
 private fun resolveNightPrayerState(totalSujood: Int): NightPrayerState {
     val maxSujood = 22
-    val clampedSujood = totalSujood.coerceIn(0, maxSujood)
-    val isAllFinished = clampedSujood >= maxSujood
+    val count = totalSujood.coerceIn(0, maxSujood)
+    val finished = count >= maxSujood
+    val effective = if (finished) maxSujood - 1 else count
 
-    val effectiveSujood =
-        if (isAllFinished) maxSujood - 1 else clampedSujood
-
-    val rakatIndexZeroBased = effectiveSujood / 2
-    val sujoodIndexInRakat = effectiveSujood % 2
-    val totalRakatNumber = rakatIndexZeroBased + 1
-
-    val sujoodLabel =
-        if (sujoodIndexInRakat == 0) "سجده اول" else "سجده دوم"
+    val rakatIndex = effective / 2
+    val sujoodIndex = effective % 2
+    val totalRakat = rakatIndex + 1
+    val sujoodLabel = if (sujoodIndex == 0) "سجده اول" else "سجده دوم"
 
     return when {
-        rakatIndexZeroBased < 8 -> {
-            val partIndex = (rakatIndexZeroBased / 2) + 1
-            val rakatInPartIndex = (rakatIndexZeroBased % 2) + 1
-            val isPartEnd =
-                rakatInPartIndex == 2 && sujoodIndexInRakat == 1
+        rakatIndex < 8 -> {
+            val part = (rakatIndex / 2) + 1
+            val rakat = (rakatIndex % 2) + 1
 
             NightPrayerState(
-                prayerName = "نماز ${ordinalPersian(partIndex)}",
-                rakatInPart = "رکعت ${ordinalPersian(rakatInPartIndex)}",
+                prayerName = "نماز ${ordinalPersian(part)}",
+                rakatInPart = "رکعت ${ordinalPersian(rakat)}",
                 sujoodInRakat = sujoodLabel,
-                totalRakatNumber = totalRakatNumber,
-                isPartEnd = isPartEnd,
+                totalRakatNumber = totalRakat,
+                isPartEnd = rakat == 2 && sujoodIndex == 1,
                 isAllFinished = false
             )
         }
 
-        rakatIndexZeroBased < 10 -> {
-            val rakatInShafa = (rakatIndexZeroBased - 8) + 1
-            val isPartEnd =
-                rakatInShafa == 2 && sujoodIndexInRakat == 1
+        rakatIndex < 10 -> {
+            val rakat = (rakatIndex - 8) + 1
 
             NightPrayerState(
                 prayerName = "نماز شفع",
-                rakatInPart = "رکعت ${ordinalPersian(rakatInShafa)}",
+                rakatInPart = "رکعت ${ordinalPersian(rakat)}",
                 sujoodInRakat = sujoodLabel,
-                totalRakatNumber = totalRakatNumber,
-                isPartEnd = isPartEnd,
+                totalRakatNumber = totalRakat,
+                isPartEnd = rakat == 2 && sujoodIndex == 1,
                 isAllFinished = false
             )
         }
 
-        else -> {
-            NightPrayerState(
-                prayerName = "نماز وتر",
-                rakatInPart = "رکعت واحد",
-                sujoodInRakat = sujoodLabel,
-                totalRakatNumber = totalRakatNumber,
-                isPartEnd = sujoodIndexInRakat == 1,
-                isAllFinished = isAllFinished
-            )
-        }
+        else -> NightPrayerState(
+            prayerName = "نماز وتر",
+            rakatInPart = "رکعت واحد",
+            sujoodInRakat = sujoodLabel,
+            totalRakatNumber = totalRakat,
+            isPartEnd = sujoodIndex == 1,
+            isAllFinished = finished
+        )
     }
 }
 
 class MainActivity : ComponentActivity() {
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Keep screen on
-        window.addFlags(
-            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
-        )
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         setContent {
             CompositionLocalProvider(
@@ -165,9 +153,16 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun RakatCounterApp() {
-
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+
+    val sensorManager = remember {
+        context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    }
+
+    val proximitySensor = remember {
+        sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY)
+    }
 
     var selectedPrayer by remember {
         mutableStateOf(PrayerType.NIGHT_PRAYER)
@@ -177,230 +172,157 @@ fun RakatCounterApp() {
         mutableIntStateOf(0)
     }
 
-    var sensorAvailable by remember {
-        mutableStateOf(true)
-    }
-
     var sensorActive by remember {
         mutableStateOf(false)
     }
-
-    var showDebug by remember {
-        mutableStateOf(true)
-    }
-
-    // Sensor manager
-
-    val sensorManager = remember {
-        context.getSystemService(
-            Context.SENSOR_SERVICE
-        ) as SensorManager
-    }
-
-    val proximitySensor = remember {
-        sensorManager.getDefaultSensor(
-            Sensor.TYPE_PROXIMITY
-        )
-    }
-
-    // Debug values
 
     var sensorDistance by remember {
         mutableFloatStateOf(Float.NaN)
     }
 
-    var sensorMaxRange by remember {
-        mutableFloatStateOf(0f)
-    }
-
-    var sensorResolution by remember {
-        mutableFloatStateOf(0f)
-    }
-
-    var sensorName by remember {
-        mutableStateOf("Unknown")
-    }
-
-    var sensorVendor by remember {
-        mutableStateOf("Unknown")
-    }
-
-    var sensorEventCount by remember {
+    var sensorEvents by remember {
         mutableIntStateOf(0)
     }
 
-    var sensorNear by remember {
-        mutableStateOf(false)
+    var sensorStatus by remember {
+        mutableStateOf("در انتظار فعال‌سازی")
     }
 
-    var lastRegisteredTime by remember {
+    var nearStatus by remember {
+        mutableStateOf("نامشخص")
+    }
+
+    var lastCountSource by remember {
         mutableStateOf("هنوز ثبت نشده")
     }
 
-    val isNightPrayer =
-        selectedPrayer == PrayerType.NIGHT_PRAYER
+    val isNightPrayer = selectedPrayer == PrayerType.NIGHT_PRAYER
+    val maxSujood = selectedPrayer.totalRakats * 2
+    val completedRakats = sujoodCount / 2
 
-    val maxSujood =
-        selectedPrayer.totalRakats * 2
+    val currentRakat = if (completedRakats < selectedPrayer.totalRakats) {
+        completedRakats + 1
+    } else {
+        selectedPrayer.totalRakats
+    }
 
-    val completedRakats =
-        sujoodCount / 2
-
-    val currentRakat =
-        if (completedRakats < selectedPrayer.totalRakats)
-            completedRakats + 1
-        else
-            selectedPrayer.totalRakats
-
-    val sujoodInCurrentRakat =
-        sujoodCount % 2
-
-    val isPrayerFinished =
-        sujoodCount >= maxSujood
+    val sujoodInCurrentRakat = sujoodCount % 2
+    val isPrayerFinished = sujoodCount >= maxSujood
 
     val nightState = remember(sujoodCount) {
         resolveNightPrayerState(sujoodCount)
     }
 
-    // Vibration
-
-    fun triggerVibration(isStrongAlert: Boolean) {
-
-        val vibrator =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-
+    fun triggerVibration(strong: Boolean) {
+        try {
+            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 val manager = context.getSystemService(
                     Context.VIBRATOR_MANAGER_SERVICE
                 ) as VibratorManager
-
                 manager.defaultVibrator
-
             } else {
-
                 @Suppress("DEPRECATION")
-                context.getSystemService(
-                    Context.VIBRATOR_SERVICE
-                ) as Vibrator
+                context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
             }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-
-            if (isStrongAlert) {
-                vibrator.vibrate(
-                    VibrationEffect.createWaveform(
-                        longArrayOf(0, 180, 100, 180, 100, 180),
-                        -1
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (strong) {
+                    vibrator.vibrate(
+                        VibrationEffect.createWaveform(
+                            longArrayOf(0, 180, 100, 180, 100, 180),
+                            -1
+                        )
                     )
-                )
+                } else {
+                    vibrator.vibrate(
+                        VibrationEffect.createOneShot(
+                            100,
+                            VibrationEffect.DEFAULT_AMPLITUDE
+                        )
+                    )
+                }
             } else {
-                vibrator.vibrate(
-                    VibrationEffect.createOneShot(
-                        100,
-                        VibrationEffect.DEFAULT_AMPLITUDE
-                    )
-                )
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(if (strong) 350 else 120)
             }
-
-        } else {
-
-            @Suppress("DEPRECATION")
-            vibrator.vibrate(
-                if (isStrongAlert) 350 else 120
-            )
+        } catch (_: Exception) {
         }
     }
 
-    // Direct proximity sensor counting + Debug
+    /*
+     * قفل مشترک برای جلوگیری از ثبت دوباره یک سجده
+     * توسط سنسور و رویداد خاموش شدن صفحه
+     */
+    val countLock = remember { Any() }
+    val lastCountTime = remember { AtomicLong(0L) }
+    val nearAlreadyCounted = remember { AtomicBoolean(false) }
+
+    val countSujood: (String) -> Unit = { source ->
+        synchronized(countLock) {
+            val now = System.currentTimeMillis()
+            val previous = lastCountTime.get()
+
+            if (!isPrayerFinished &&
+                sujoodCount < maxSujood &&
+                now - previous >= 2200L
+            ) {
+                sujoodCount = (sujoodCount + 1).coerceAtMost(maxSujood)
+                lastCountTime.set(now)
+                lastCountSource = source
+
+                val strong = if (isNightPrayer) {
+                    resolveNightPrayerState(sujoodCount).isPartEnd
+                } else {
+                    sujoodCount % 2 == 0
+                }
+
+                triggerVibration(strong)
+            }
+        }
+    }
 
     DisposableEffect(
-        sensorManager,
-        proximitySensor,
         lifecycleOwner,
+        proximitySensor,
         selectedPrayer,
         isPrayerFinished
     ) {
+        val sensor = proximitySensor
 
-        if (proximitySensor == null) {
-            sensorAvailable = false
+        if (sensor == null) {
+            sensorStatus = "سنسور مجاورت پیدا نشد"
             sensorActive = false
             return@DisposableEffect onDispose {}
         }
 
-        sensorAvailable = true
-
-        sensorMaxRange = proximitySensor.maximumRange
-        sensorResolution = proximitySensor.resolution
-        sensorName = proximitySensor.name
-        sensorVendor = proximitySensor.vendor
-
-        var isListening = false
-        var hasInitialValue = false
-        var lastNear = false
-        var lastSujoodTimestamp = 0L
-
-        val minDelayBetweenSujoods = 2200L
+        var lastNear: Boolean? = null
 
         val listener = object : SensorEventListener {
-
             override fun onSensorChanged(event: SensorEvent) {
-
                 if (event.values.isEmpty()) return
 
                 val value = event.values[0]
-
-                val currentlyNear =
-                    value < proximitySensor.maximumRange
-
-                // Update Debug values
-
                 sensorDistance = value
-                sensorNear = currentlyNear
-                sensorEventCount++
+                sensorEvents++
 
-                // First event initializes state only
+                val isNear = value < sensor.maximumRange
+                nearStatus = if (isNear) "NEAR - نزدیک" else "FAR - دور"
 
-                if (!hasInitialValue) {
-                    lastNear = currentlyNear
-                    hasInitialValue = true
+                if (lastNear == null) {
+                    lastNear = isNear
                     return
                 }
 
-                val currentTime = System.currentTimeMillis()
+                val wasNear = lastNear!!
+                lastNear = isNear
 
-                // FAR -> NEAR transition
-
-                if (currentlyNear && !lastNear) {
-
-                    if (
-                        !isPrayerFinished &&
-                        currentTime - lastSujoodTimestamp >=
-                        minDelayBetweenSujoods
-                    ) {
-
-                        sujoodCount++
-
-                        lastSujoodTimestamp = currentTime
-
-                        lastRegisteredTime =
-                            java.text.SimpleDateFormat(
-                                "HH:mm:ss",
-                                Locale.US
-                            ).format(java.util.Date())
-
-                        val strongAlert =
-                            if (isNightPrayer) {
-                                resolveNightPrayerState(
-                                    sujoodCount
-                                ).isPartEnd
-                            } else {
-                                sujoodCount % 2 == 0
-                            }
-
-                        triggerVibration(strongAlert)
+                if (!wasNear && isNear) {
+                    if (nearAlreadyCounted.compareAndSet(false, true)) {
+                        countSujood("سنسور NEAR")
                     }
+                } else if (wasNear && !isNear) {
+                    nearAlreadyCounted.set(false)
                 }
-
-                lastNear = currentlyNear
             }
 
             override fun onAccuracyChanged(
@@ -410,40 +332,88 @@ fun RakatCounterApp() {
             }
         }
 
-        fun startListening() {
-
-            if (!isListening) {
-
-                isListening = sensorManager.registerListener(
-                    listener,
-                    proximitySensor,
-                    SensorManager.SENSOR_DELAY_GAME
-                )
-
-                sensorActive = isListening
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                if (intent?.action == Intent.ACTION_SCREEN_OFF) {
+                    /*
+                     * مسیر پشتیبان:
+                     * اگر سنسور هنوز NEAR را ثبت نکرده باشد،
+                     * خاموش شدن صفحه یک بار شمارش را انجام می‌دهد.
+                     */
+                    if (nearAlreadyCounted.compareAndSet(false, true)) {
+                        countSujood("خاموش شدن صفحه")
+                    }
+                }
             }
         }
 
-        fun stopListening() {
+        val filter = IntentFilter(Intent.ACTION_SCREEN_OFF)
 
-            if (isListening) {
-                sensorManager.unregisterListener(listener)
-                isListening = false
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                context.registerReceiver(
+                    receiver,
+                    filter,
+                    Context.RECEIVER_EXPORTED
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                context.registerReceiver(receiver, filter)
             }
+        } catch (e: Exception) {
+            sensorStatus = "خطا در ثبت گیرنده: ${e.message}"
+        }
 
-            sensorActive = false
+        val powerManager = context.getSystemService(
+            Context.POWER_SERVICE
+        ) as PowerManager
+
+        val wakeLock = try {
+            powerManager.newWakeLock(
+                PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK,
+                "RakatCounter:ProximitySujood"
+            )
+        } catch (_: Exception) {
+            null
         }
 
         val observer = LifecycleEventObserver { _, event ->
-
             when (event) {
-
                 Lifecycle.Event.ON_RESUME -> {
-                    startListening()
+                    val registered = sensorManager.registerListener(
+                        listener,
+                        sensor,
+                        SensorManager.SENSOR_DELAY_GAME
+                    )
+
+                    sensorActive = registered
+                    sensorStatus = if (registered) {
+                        "سنسور فعال است"
+                    } else {
+                        "ثبت سنسور ناموفق بود"
+                    }
+
+                    if (!isPrayerFinished &&
+                        wakeLock != null &&
+                        !wakeLock.isHeld
+                    ) {
+                        try {
+                            wakeLock.acquire()
+                        } catch (_: Exception) {
+                        }
+                    }
                 }
 
                 Lifecycle.Event.ON_PAUSE -> {
-                    stopListening()
+                    sensorManager.unregisterListener(listener)
+                    sensorActive = false
+
+                    if (wakeLock?.isHeld == true) {
+                        try {
+                            wakeLock.release()
+                        } catch (_: Exception) {
+                        }
+                    }
                 }
 
                 else -> Unit
@@ -453,19 +423,51 @@ fun RakatCounterApp() {
         lifecycleOwner.lifecycle.addObserver(observer)
 
         if (
-            lifecycleOwner.lifecycle.currentState
-                .isAtLeast(Lifecycle.State.RESUMED)
+            lifecycleOwner.lifecycle.currentState.isAtLeast(
+                Lifecycle.State.RESUMED
+            )
         ) {
-            startListening()
+            val registered = sensorManager.registerListener(
+                listener,
+                sensor,
+                SensorManager.SENSOR_DELAY_GAME
+            )
+
+            sensorActive = registered
+            sensorStatus = if (registered) {
+                "سنسور فعال است"
+            } else {
+                "ثبت سنسور ناموفق بود"
+            }
+
+            if (!isPrayerFinished && wakeLock != null) {
+                try {
+                    if (!wakeLock.isHeld) wakeLock.acquire()
+                } catch (_: Exception) {
+                }
+            }
         }
 
         onDispose {
-            stopListening()
+            sensorManager.unregisterListener(listener)
+
+            if (wakeLock?.isHeld == true) {
+                try {
+                    wakeLock.release()
+                } catch (_: Exception) {
+                }
+            }
+
             lifecycleOwner.lifecycle.removeObserver(observer)
+
+            try {
+                context.unregisterReceiver(receiver)
+            } catch (_: Exception) {
+            }
+
+            sensorActive = false
         }
     }
-
-    // Main screen
 
     Column(
         modifier = Modifier
@@ -475,12 +477,9 @@ fun RakatCounterApp() {
             .padding(horizontal = 16.dp, vertical = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-
-        // Header
-
         Text(
-            text = "رکعت‌شمار هوشمند نماز",
-            fontSize = 22.sp,
+            "رکعت‌شمار هوشمند نماز",
+            fontSize = 23.sp,
             fontWeight = FontWeight.Bold,
             color = Color.White
         )
@@ -488,285 +487,102 @@ fun RakatCounterApp() {
         Spacer(modifier = Modifier.height(6.dp))
 
         Text(
-            text = if (isNightPrayer) {
-                "با نزدیک‌شدن پیشانی به سنسور، یک سجده ثبت می‌شود."
-            } else {
-                "گوشی را کنار مُهر قرار دهید و با نزدیک‌شدن پیشانی به سنسور سجده ثبت کنید."
-            },
-            fontSize = 12.sp,
-            color = Color.Gray,
+            "با نزدیک شدن انگشت به سنسور، صفحه خاموش شده و سجده ثبت می‌شود.",
+            fontSize = 13.sp,
+            color = Color.LightGray,
             textAlign = TextAlign.Center
         )
 
-        Spacer(modifier = Modifier.height(5.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
         Text(
-            text = if (sensorActive)
-                "سنسور مجاورت: فعال (شمارش مستقیم)"
-            else
-                "سنسور مجاورت: غیرفعال",
-            fontSize = 12.sp,
-            color = if (sensorActive)
-                Color(0xFF81C784)
-            else
-                Color(0xFFFFB74D)
+            if (sensorActive) "سنسور: فعال" else "سنسور: غیرفعال",
+            color = if (sensorActive) Color(0xFF81C784) else Color.Red,
+            fontWeight = FontWeight.Bold
         )
 
-        Spacer(modifier = Modifier.height(10.dp))
+        Spacer(modifier = Modifier.height(16.dp))
 
-        // Debug button
-
-        OutlinedButton(
-            onClick = { showDebug = !showDebug },
-            modifier = Modifier.fillMaxWidth()
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(260.dp)
+                .clip(CircleShape)
+                .background(
+                    if (isPrayerFinished) Color(0xFF1B5E20)
+                    else MaterialTheme.colorScheme.surface
+                )
+                .padding(16.dp)
         ) {
-            Text(
-                if (showDebug)
-                    "مخفی کردن Debug"
-                else
-                    "نمایش Debug"
-            )
-        }
+            if (isPrayerFinished) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        "تقبل الله",
+                        fontSize = 32.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFA5D6A7)
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        "${selectedPrayer.title} تمام شد",
+                        color = Color.White,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            } else if (isNightPrayer) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        nightState.prayerName,
+                        fontSize = 26.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = Color(0xFFA5D6A7)
+                    )
 
-        // Debug panel
-
-        if (showDebug) {
-
-            Surface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 5.dp),
-                color = Color(0xFF263238),
-                shape = RoundedCornerShape(12.dp)
-            ) {
-
-                Column(
-                    modifier = Modifier.padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
+                    Spacer(modifier = Modifier.height(8.dp))
 
                     Text(
-                        "PROXIMITY SENSOR DEBUG",
-                        color = Color(0xFF80CBC4),
+                        "${nightState.rakatInPart} • ${nightState.sujoodInRakat}",
+                        fontSize = 18.sp,
                         fontWeight = FontWeight.Bold,
-                        fontSize = 14.sp
+                        color = Color.White
                     )
 
-                    HorizontalDivider(color = Color.Gray)
+                    Spacer(modifier = Modifier.height(8.dp))
 
-                    DebugRow("Sensor", sensorName)
-                    DebugRow("Vendor", sensorVendor)
-
-                    DebugRow(
-                        "Distance",
-                        if (sensorDistance.isNaN())
-                            "Waiting..."
-                        else
-                            String.format(
-                                Locale.US,
-                                "%.3f",
-                                sensorDistance
-                            )
+                    Text(
+                        "رکعت ${nightState.totalRakatNumber} از ۱۱",
+                        fontSize = 14.sp,
+                        color = Color.LightGray
                     )
 
-                    DebugRow(
-                        "Maximum Range",
-                        String.format(
-                            Locale.US,
-                            "%.3f",
-                            sensorMaxRange
-                        )
-                    )
-
-                    DebugRow(
-                        "Resolution",
-                        String.format(
-                            Locale.US,
-                            "%.4f",
-                            sensorResolution
-                        )
-                    )
-
-                    DebugRow(
-                        "Sensor State",
-                        if (sensorDistance.isNaN())
-                            "WAITING"
-                        else if (sensorNear)
-                            "NEAR"
-                        else
-                            "FAR",
-                        if (sensorNear)
-                            Color(0xFFFFB74D)
-                        else
-                            Color(0xFF81C784)
-                    )
-
-                    DebugRow(
-                        "Event Count",
-                        sensorEventCount.toString()
-                    )
-
-                    DebugRow(
-                        "Registered",
-                        sujoodCount.toString()
-                    )
-
-                    DebugRow(
-                        "Last Sujood",
-                        lastRegisteredTime
-                    )
-
-                    DebugRow(
-                        "ADC",
-                        "Unavailable via standard API",
-                        Color.LightGray
-                    )
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(18.dp))
-
-        // Sensor availability
-
-        if (!sensorAvailable) {
-
-            Text(
-                text = "خطا: سنسور مجاورت در گوشی یافت نشد!",
-                color = Color.Red,
-                fontWeight = FontWeight.Bold
-            )
-
-        } else {
-
-            // Main counter
-
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .size(275.dp)
-                    .clip(CircleShape)
-                    .background(
-                        if (isPrayerFinished)
-                            Color(0xFF1B5E20)
-                        else
-                            MaterialTheme.colorScheme.surface
-                    )
-                    .padding(16.dp)
-            ) {
-
-                if (isPrayerFinished) {
-
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-
-                        Text(
-                            "تقبل الله",
-                            fontSize = 32.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color(0xFFA5D6A7)
-                        )
-
+                    if (nightState.isPartEnd) {
                         Spacer(modifier = Modifier.height(8.dp))
-
                         Text(
-                            "${selectedPrayer.title} (${selectedPrayer.totalRakats} رکعت) تمام شد",
-                            fontSize = 15.sp,
-                            color = Color.White,
-                            textAlign = TextAlign.Center
+                            "پایان این بخش (سلام)",
+                            color = Color(0xFFC8E6C9),
+                            fontSize = 13.sp
                         )
                     }
+                }
+            } else {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("رکعت", fontSize = 20.sp, color = Color.LightGray)
 
-                } else if (isNightPrayer) {
+                    Text(
+                        "$currentRakat از ${selectedPrayer.totalRakats}",
+                        fontSize = 48.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = Color.White
+                    )
 
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
+                    Spacer(modifier = Modifier.height(12.dp))
 
-                        Text(
-                            nightState.prayerName,
-                            fontSize = 26.sp,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = Color(0xFFA5D6A7),
-                            textAlign = TextAlign.Center
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        SujoodIndicator(
+                            "سجده ۱",
+                            sujoodInCurrentRakat >= 1
                         )
-
-                        Spacer(modifier = Modifier.height(6.dp))
-
-                        Text(
-                            "${nightState.rakatInPart} • ${nightState.sujoodInRakat}",
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White,
-                            textAlign = TextAlign.Center
-                        )
-
-                        Spacer(modifier = Modifier.height(6.dp))
-
-                        Text(
-                            "رکعت ${nightState.totalRakatNumber} از ۱۱",
-                            fontSize = 13.sp,
-                            color = Color.LightGray
-                        )
-
-                        if (nightState.isPartEnd) {
-
-                            Spacer(modifier = Modifier.height(8.dp))
-
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = Color(0xFF4CAF50).copy(alpha = 0.25f)
-                            ) {
-
-                                Text(
-                                    "پایان این بخش (سلام)",
-                                    fontSize = 12.sp,
-                                    color = Color(0xFFC8E6C9),
-                                    modifier = Modifier.padding(
-                                        horizontal = 10.dp,
-                                        vertical = 4.dp
-                                    )
-                                )
-                            }
-                        }
-                    }
-
-                } else {
-
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-
-                        Text(
-                            "رکعت",
-                            fontSize = 20.sp,
-                            color = Color.LightGray
-                        )
-
-                        Text(
-                            "$currentRakat از ${selectedPrayer.totalRakats}",
-                            fontSize = 48.sp,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = Color.White
-                        )
-
-                        Spacer(modifier = Modifier.height(12.dp))
-
-                        Row(
-                            horizontalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-
-                            SujoodIndicator(
-                                label = "سجده ۱",
-                                isDone = sujoodInCurrentRakat >= 1
-                            )
-
-                            SujoodIndicator(
-                                label = "سجده ۲",
-                                isDone = false
-                            )
-                        }
+                        SujoodIndicator("سجده ۲", false)
                     }
                 }
             }
@@ -774,151 +590,147 @@ fun RakatCounterApp() {
 
         Spacer(modifier = Modifier.height(18.dp))
 
-        // Prayer selection
+        Text("انتخاب نماز", color = Color.White, fontWeight = FontWeight.Bold)
 
-        LazyVerticalGrid(
-            columns = GridCells.Fixed(3),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(92.dp),
-            userScrollEnabled = false
-        ) {
+        Spacer(modifier = Modifier.height(8.dp))
 
-            items(PrayerType.entries) { prayer ->
-
-                val isSelected = prayer == selectedPrayer
-
-                FilterChip(
-                    selected = isSelected,
-                    onClick = {
-                        selectedPrayer = prayer
-                        sujoodCount = 0
-                        lastRegisteredTime = "هنوز ثبت نشده"
-                    },
-                    label = {
-                        Text(
-                            text = prayer.title.replace("نماز ", ""),
-                            modifier = Modifier.fillMaxWidth(),
-                            textAlign = TextAlign.Center,
-                            fontWeight = if (isSelected)
-                                FontWeight.Bold
-                            else
-                                FontWeight.Normal
-                        )
-                    },
-                    colors = FilterChipDefaults.filterChipColors(
-                        selectedContainerColor =
-                            MaterialTheme.colorScheme.primary,
-                        selectedLabelColor = Color.White
+        PrayerType.entries.chunked(3).forEach { rowPrayers ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                rowPrayers.forEach { prayer ->
+                    FilterChip(
+                        selected = selectedPrayer == prayer,
+                        onClick = {
+                            selectedPrayer = prayer
+                            sujoodCount = 0
+                            lastCountSource = "هنوز ثبت نشده"
+                            nearAlreadyCounted.set(false)
+                        },
+                        label = {
+                            Text(
+                                prayer.title.replace("نماز ", ""),
+                                fontSize = 12.sp
+                            )
+                        },
+                        modifier = Modifier.weight(1f)
                     )
-                )
+                }
+
+                repeat(3 - rowPrayers.size) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
             }
         }
 
-        Spacer(modifier = Modifier.height(10.dp))
-
-        // Manual controls
+        Spacer(modifier = Modifier.height(14.dp))
 
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-
             OutlinedButton(
                 onClick = {
-                    if (!isPrayerFinished) {
-                        sujoodCount++
-                    }
+                    if (!isPrayerFinished) sujoodCount++
                 },
-                modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(12.dp)
+                modifier = Modifier.weight(1f)
             ) {
-                Text("ثبت دستی", fontSize = 13.sp)
+                Text("ثبت دستی")
             }
 
             OutlinedButton(
                 onClick = {
-                    if (sujoodCount > 0) {
-                        sujoodCount--
-                    }
+                    if (sujoodCount > 0) sujoodCount--
                 },
-                modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(12.dp)
+                modifier = Modifier.weight(1f)
             ) {
-                Text("برگشت", fontSize = 13.sp)
+                Text("برگشت")
             }
 
             Button(
                 onClick = {
                     sujoodCount = 0
-                    lastRegisteredTime = "هنوز ثبت نشده"
+                    lastCountSource = "هنوز ثبت نشده"
+                    nearAlreadyCounted.set(false)
+                    lastCountTime.set(0L)
                 },
                 modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(12.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = Color(0xFFC62828)
                 )
             ) {
-                Text(
-                    "شروع مجدد",
-                    color = Color.White,
-                    fontSize = 13.sp
-                )
+                Text("شروع مجدد")
             }
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(20.dp))
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = Color(0xFF252525)
+            )
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                Text(
+                    "اطلاعات سنسور",
+                    color = Color(0xFF81C784),
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 17.sp
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                DebugRow("نام سنسور", proximitySensor?.name ?: "-")
+                DebugRow("سازنده", proximitySensor?.vendor ?: "-")
+                DebugRow(
+                    "Distance",
+                    if (sensorDistance.isNaN()) "-" else sensorDistance.toString()
+                )
+                DebugRow(
+                    "Maximum Range",
+                    proximitySensor?.maximumRange?.toString() ?: "-"
+                )
+                DebugRow(
+                    "Resolution",
+                    proximitySensor?.resolution?.toString() ?: "-"
+                )
+                DebugRow("وضعیت", nearStatus)
+                DebugRow("تعداد رویدادها", sensorEvents.toString())
+                DebugRow("وضعیت ثبت", sensorStatus)
+                DebugRow("آخرین مسیر شمارش", lastCountSource)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(20.dp))
     }
 }
 
-// Debug row
-
 @Composable
-fun DebugRow(
-    label: String,
-    value: String,
-    valueColor: Color = Color.White
-) {
-
+fun DebugRow(label: String, value: String) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
     ) {
-
+        Text(label, color = Color.LightGray, fontSize = 13.sp)
         Text(
-            text = label,
-            color = Color.LightGray,
-            fontSize = 12.sp
-        )
-
-        Text(
-            text = value,
-            color = valueColor,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Bold
+            value,
+            color = Color.White,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Medium
         )
     }
 }
 
-// Sujood indicator
-
 @Composable
-fun SujoodIndicator(
-    label: String,
-    isDone: Boolean
-) {
-
+fun SujoodIndicator(label: String, isDone: Boolean) {
     Surface(
         shape = RoundedCornerShape(8.dp),
-        color = if (isDone)
-            Color(0xFF4CAF50)
-        else
-            Color(0xFF333333)
+        color = if (isDone) Color(0xFF4CAF50) else Color(0xFF333333)
     ) {
-
         Text(
             text = if (isDone) "$label ✓" else label,
             modifier = Modifier.padding(
