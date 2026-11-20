@@ -13,6 +13,7 @@ import android.os.VibratorManager
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -44,12 +45,12 @@ enum class PrayerType(val title: String, val totalRakats: Int) {
 }
 
 data class NightPrayerState(
-    val prayerName: String,     // مثلا "نماز سوم" یا "نماز شفع" یا "نماز وتر"
-    val rakatInPart: String,    // مثلا "رکعت اول" یا "رکعت دوم" یا "رکعت واحد"
-    val sujoodInRakat: String,  // مثلا "سجده اول" یا "سجده دوم"
-    val totalRakatNumber: Int,  // شماره کل رکعت از ۱ تا ۱۱
-    val isPartEnd: Boolean,     // آیا این سجده پایان یک نماز ۲ رکعتی/وتر است؟
-    val isAllFinished: Boolean  // آیا کل ۱۱ رکعت تمام شده؟
+    val prayerName: String,
+    val rakatInPart: String,
+    val sujoodInRakat: String,
+    val totalRakatNumber: Int,
+    val isPartEnd: Boolean,
+    val isAllFinished: Boolean
 )
 
 private fun ordinalPersian(num: Int): String = when (num) {
@@ -119,6 +120,7 @@ private fun resolveNightPrayerState(totalSujood: Int): NightPrayerState {
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
@@ -202,7 +204,7 @@ fun RakatCounterApp() {
 
         maxSensorRange = proximitySensor.maximumRange
         val nearThreshold = if (proximitySensor.maximumRange > 1f) {
-            proximitySensor.maximumRange * 0.95f
+            proximitySensor.maximumRange - 0.01f
         } else {
             proximitySensor.maximumRange
         }
@@ -240,7 +242,7 @@ fun RakatCounterApp() {
         sensorManager.registerListener(
             sensorListener,
             proximitySensor,
-            SensorManager.SENSOR_DELAY_GAME
+            SensorManager.SENSOR_DELAY_FASTEST
         )
 
         onDispose {
@@ -251,50 +253,41 @@ fun RakatCounterApp() {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(16.dp),
+            .safeDrawingPadding()
+            .padding(horizontal = 16.dp, vertical = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.SpaceBetween
     ) {
+        // بخش بالا: عنوان و اطلاعات سنسور
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(
                 text = "رکعت‌شمار هوشمند نماز",
                 fontSize = 22.sp,
                 fontWeight = FontWeight.Bold,
                 color = Color.White,
-                modifier = Modifier.padding(bottom = 12.dp)
+                modifier = Modifier.padding(bottom = 6.dp)
             )
 
-            LazyVerticalGrid(
-                columns = GridCells.Fixed(3),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                items(PrayerType.entries) { prayer ->
-                    val isSelected = prayer == selectedPrayer
-                    FilterChip(
-                        selected = isSelected,
-                        onClick = {
-                            selectedPrayer = prayer
-                            sujoodCount = 0
-                        },
-                        label = {
-                            Text(
-                                text = prayer.title.replace("نماز ", ""),
-                                modifier = Modifier.fillMaxWidth(),
-                                textAlign = TextAlign.Center,
-                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
-                            )
-                        },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = MaterialTheme.colorScheme.primary,
-                            selectedLabelColor = Color.White
-                        )
-                    )
-                }
-            }
+            Text(
+                text = if (isNightPrayer) {
+                    "ترتیب خودکار: نماز اول تا چهارم (هر کدام ۲ رکعت) ← نماز شفع (۲ رکعت) ← نماز وتر (۱ رکعت)"
+                } else {
+                    "گوشی را کنار مُهر قرار دهید تا هنگام سجده، صورت یا چانه بالای سنسور قرار گیرد."
+                },
+                fontSize = 12.sp,
+                color = Color.Gray,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(bottom = 4.dp)
+            )
+
+            Text(
+                text = "سنسور: ${if (isNear) "نزدیک" else "دور"} | فاصله: $rawDistance / $maxSensorRange",
+                fontSize = 11.sp,
+                color = Color(0xFF9E9E9E)
+            )
         }
 
+        // بخش میانی: نمایشگر وضعیت رکعت و سجده
         if (!sensorAvailable) {
             Text(
                 text = "خطا: سنسور مجاورت در این گوشی یافت نشد!",
@@ -305,7 +298,7 @@ fun RakatCounterApp() {
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
-                    .size(285.dp)
+                    .size(275.dp)
                     .clip(CircleShape)
                     .background(
                         when {
@@ -393,39 +386,63 @@ fun RakatCounterApp() {
             }
         }
 
+        // بخش پایین: انتخاب نماز + دکمه‌های کنترلی (کاملا بالاتر از دکمه‌های سیستم)
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text(
-                text = if (isNightPrayer) {
-                    "ترتیب خودکار: نماز اول تا چهارم (هر کدام ۲ رکعت) ← نماز شفع (۲ رکعت) ← نماز وتر (۱ رکعت)"
-                } else {
-                    "گوشی را کنار مُهر قرار دهید تا هنگام سجده، صورت یا چانه بالای سنسور قرار گیرد."
-                },
-                fontSize = 12.sp,
-                color = Color.Gray,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.padding(bottom = 6.dp)
-            )
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(3),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(92.dp)
+            ) {
+                items(PrayerType.entries) { prayer ->
+                    val isSelected = prayer == selectedPrayer
+                    FilterChip(
+                        selected = isSelected,
+                        onClick = {
+                            selectedPrayer = prayer
+                            sujoodCount = 0
+                        },
+                        label = {
+                            Text(
+                                text = prayer.title.replace("نماز ", ""),
+                                modifier = Modifier.fillMaxWidth(),
+                                textAlign = TextAlign.Center,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                            )
+                        },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = MaterialTheme.colorScheme.primary,
+                            selectedLabelColor = Color.White
+                        )
+                    )
+                }
+            }
 
-            Text(
-                text = "سنسور: ${if (isNear) "نزدیک" else "دور"} | فاصله: $rawDistance / $maxSensorRange",
-                fontSize = 11.sp,
-                color = Color(0xFF9E9E9E),
-                modifier = Modifier.padding(bottom = 12.dp)
-            )
+            Spacer(modifier = Modifier.height(10.dp))
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedButton(
                     onClick = { if (!isPrayerFinished) sujoodCount++ },
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(12.dp)
                 ) {
-                    Text("ثبت دستی سجده", fontSize = 15.sp)
+                    Text("ثبت دستی", fontSize = 13.sp)
+                }
+
+                OutlinedButton(
+                    onClick = { if (sujoodCount > 0) sujoodCount-- },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text("برگشت ۱ سجده", fontSize = 13.sp)
                 }
 
                 Button(
@@ -434,7 +451,7 @@ fun RakatCounterApp() {
                     shape = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828))
                 ) {
-                    Text("شروع مجدد", color = Color.White, fontSize = 15.sp)
+                    Text("شروع مجدد", color = Color.White, fontSize = 13.sp)
                 }
             }
         }
