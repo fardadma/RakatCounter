@@ -1,12 +1,12 @@
 package com.example.rakatcounter
 
+import android.content.BroadcastReceiver
 import android.content.Context
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -29,11 +29,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 
 enum class PrayerType(val title: String, val totalRakats: Int) {
     FAJR("نماز صبح", 2),
@@ -67,11 +70,9 @@ private fun resolveNightPrayerState(totalSujood: Int): NightPrayerState {
     val isAllFinished = clampedSujood >= maxSujood
 
     val effectiveSujood = if (isAllFinished) maxSujood - 1 else clampedSujood
-
     val rakatIndexZeroBased = effectiveSujood / 2
     val sujoodIndexInRakat = effectiveSujood % 2
     val totalRakatNumber = rakatIndexZeroBased + 1
-
     val sujoodLabel = if (sujoodIndexInRakat == 0) "سجده اول" else "سجده دوم"
 
     return when {
@@ -79,7 +80,6 @@ private fun resolveNightPrayerState(totalSujood: Int): NightPrayerState {
             val partIndex = (rakatIndexZeroBased / 2) + 1
             val rakatInPartIndex = (rakatIndexZeroBased % 2) + 1
             val isPartEnd = (rakatInPartIndex == 2 && sujoodIndexInRakat == 1)
-
             NightPrayerState(
                 prayerName = "نماز ${ordinalPersian(partIndex)}",
                 rakatInPart = "رکعت ${ordinalPersian(rakatInPartIndex)}",
@@ -89,11 +89,9 @@ private fun resolveNightPrayerState(totalSujood: Int): NightPrayerState {
                 isAllFinished = false
             )
         }
-
         rakatIndexZeroBased < 10 -> {
             val rakatInShafa = (rakatIndexZeroBased - 8) + 1
             val isPartEnd = (rakatInShafa == 2 && sujoodIndexInRakat == 1)
-
             NightPrayerState(
                 prayerName = "نماز شفع",
                 rakatInPart = "رکعت ${ordinalPersian(rakatInShafa)}",
@@ -103,7 +101,6 @@ private fun resolveNightPrayerState(totalSujood: Int): NightPrayerState {
                 isAllFinished = false
             )
         }
-
         else -> {
             val isPartEnd = (sujoodIndexInRakat == 1)
             NightPrayerState(
@@ -149,23 +146,17 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun RakatCounterApp() {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     var selectedPrayer by remember { mutableStateOf(PrayerType.NIGHT_PRAYER) }
     var sujoodCount by remember { mutableIntStateOf(0) }
-    var isNear by remember { mutableStateOf(false) }
     var sensorAvailable by remember { mutableStateOf(true) }
-    var rawDistance by remember { mutableFloatStateOf(-1f) }
-    var maxSensorRange by remember { mutableFloatStateOf(0f) }
+    var isScreenMethodActive by remember { mutableStateOf(false) }
 
     val isNightPrayer = selectedPrayer == PrayerType.NIGHT_PRAYER
     val maxSujood = selectedPrayer.totalRakats * 2
-
     val completedRakats = sujoodCount / 2
-    val currentRakat = if (completedRakats < selectedPrayer.totalRakats) {
-        completedRakats + 1
-    } else {
-        selectedPrayer.totalRakats
-    }
+    val currentRakat = if (completedRakats < selectedPrayer.totalRakats) completedRakats + 1 else selectedPrayer.totalRakats
     val sujoodInCurrentRakat = sujoodCount % 2
     val isPrayerFinished = sujoodCount >= maxSujood
     val nightState = remember(sujoodCount) { resolveNightPrayerState(sujoodCount) }
@@ -181,9 +172,7 @@ fun RakatCounterApp() {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             if (isStrongAlert) {
-                vibrator.vibrate(
-                    VibrationEffect.createWaveform(longArrayOf(0, 180, 100, 180, 100, 180), -1)
-                )
+                vibrator.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 180, 100, 180, 100, 180), -1))
             } else {
                 vibrator.vibrate(VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE))
             }
@@ -193,33 +182,33 @@ fun RakatCounterApp() {
         }
     }
 
-    DisposableEffect(selectedPrayer, isPrayerFinished) {
-        val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        val proximitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY)
+    DisposableEffect(lifecycleOwner, selectedPrayer, isPrayerFinished) {
+        val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        
+        // بررسی پشتیبانی گوشی از این نوع WakeLock
+        val wakeLockSupported = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            powerManager.isWakeLockLevelSupported(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK)
+        } else {
+            true // دستگاه‌های خیلی قدیمی پیش‌فرض فرض می‌کنند دارند
+        }
 
-        if (proximitySensor == null) {
+        if (!wakeLockSupported) {
             sensorAvailable = false
             return@DisposableEffect onDispose {}
         }
 
-        maxSensorRange = proximitySensor.maximumRange
-        val nearThreshold = if (proximitySensor.maximumRange > 1f) {
-            proximitySensor.maximumRange - 0.01f
-        } else {
-            proximitySensor.maximumRange
-        }
+        val wakeLock = powerManager.newWakeLock(
+            PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK,
+            "RakatCounter:ProximitySujood"
+        )
 
         var lastSujoodTimestamp = 0L
         val minDelayBetweenSujoods = 2200L
 
-        val sensorListener = object : SensorEventListener {
-            override fun onSensorChanged(event: SensorEvent?) {
-                event ?: return
-                val distance = event.values[0]
-                rawDistance = distance
-                val currentlyNear = distance < nearThreshold
-
-                if (currentlyNear && !isNear && !isPrayerFinished) {
+        // گوش دادن به خاموش شدن صفحه نمایش
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                if (intent?.action == Intent.ACTION_SCREEN_OFF && !isPrayerFinished) {
                     val currentTime = System.currentTimeMillis()
                     if (currentTime - lastSujoodTimestamp > minDelayBetweenSujoods) {
                         sujoodCount++
@@ -233,20 +222,43 @@ fun RakatCounterApp() {
                         triggerVibration(strongAlert)
                     }
                 }
-                isNear = currentlyNear
             }
-
-            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
         }
 
-        sensorManager.registerListener(
-            sensorListener,
-            proximitySensor,
-            SensorManager.SENSOR_DELAY_FASTEST
-        )
+        val filter = IntentFilter(Intent.ACTION_SCREEN_OFF)
+        context.registerReceiver(receiver, filter)
+
+        // مدیریت لایف‌سایکل تا سنسور فقط وقتی در برنامه هستیم فعال باشد
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                if (!isPrayerFinished && !wakeLock.isHeld) {
+                    wakeLock.acquire()
+                    isScreenMethodActive = true
+                }
+            } else if (event == Lifecycle.Event.ON_PAUSE) {
+                if (wakeLock.isHeld) {
+                    wakeLock.release()
+                    isScreenMethodActive = false
+                }
+            }
+        }
+
+        lifecycleOwner.lifecycle.addObserver(observer)
+
+        // فعال‌سازی اولیه در صورت باز بودن برنامه
+        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) && !isPrayerFinished && !wakeLock.isHeld) {
+            wakeLock.acquire()
+            isScreenMethodActive = true
+        }
 
         onDispose {
-            sensorManager.unregisterListener(sensorListener)
+            if (wakeLock.isHeld) {
+                wakeLock.release()
+            }
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            try {
+                context.unregisterReceiver(receiver)
+            } catch (e: Exception) {}
         }
     }
 
@@ -258,7 +270,6 @@ fun RakatCounterApp() {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.SpaceBetween
     ) {
-        // بخش بالا: عنوان و اطلاعات سنسور
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(
                 text = "رکعت‌شمار هوشمند نماز",
@@ -270,9 +281,9 @@ fun RakatCounterApp() {
 
             Text(
                 text = if (isNightPrayer) {
-                    "ترتیب خودکار: نماز اول تا چهارم (هر کدام ۲ رکعت) ← نماز شفع (۲ رکعت) ← نماز وتر (۱ رکعت)"
+                    "هنگام سجده، صفحه‌نمایش به طور خودکار خاموش شده و یک سجده ثبت می‌شود."
                 } else {
-                    "گوشی را کنار مُهر قرار دهید تا هنگام سجده، صورت یا چانه بالای سنسور قرار گیرد."
+                    "گوشی را کنار مُهر قرار دهید. با نزدیک شدن پیشانی به سنسور، صفحه خاموش شده و می‌شمارد."
                 },
                 fontSize = 12.sp,
                 color = Color.Gray,
@@ -281,16 +292,15 @@ fun RakatCounterApp() {
             )
 
             Text(
-                text = "سنسور: ${if (isNear) "نزدیک" else "دور"} | فاصله: $rawDistance / $maxSensorRange",
+                text = if (isScreenMethodActive) "مدیریت سنسور: فعال (سیستمی)" else "مدیریت سنسور: غیرفعال",
                 fontSize = 11.sp,
                 color = Color(0xFF9E9E9E)
             )
         }
 
-        // بخش میانی: نمایشگر وضعیت رکعت و سجده
         if (!sensorAvailable) {
             Text(
-                text = "خطا: سنسور مجاورت در این گوشی یافت نشد!",
+                text = "خطا: سنسور مجاورت سخت‌افزاری در این گوشی یافت نشد!",
                 color = Color.Red,
                 fontWeight = FontWeight.Bold
             )
@@ -303,7 +313,6 @@ fun RakatCounterApp() {
                     .background(
                         when {
                             isPrayerFinished -> Color(0xFF1B5E20)
-                            isNear -> Color(0xFF2E7D32).copy(alpha = 0.45f)
                             else -> MaterialTheme.colorScheme.surface
                         }
                     )
@@ -355,7 +364,7 @@ fun RakatCounterApp() {
                                 color = Color(0xFF4CAF50).copy(alpha = 0.25f)
                             ) {
                                 Text(
-                                    text = "پایان این بخش (سلام و شروع بخش بعد)",
+                                    text = "پایان این بخش (سلام)",
                                     fontSize = 12.sp,
                                     color = Color(0xFFC8E6C9),
                                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
@@ -386,7 +395,6 @@ fun RakatCounterApp() {
             }
         }
 
-        // بخش پایین: انتخاب نماز + دکمه‌های کنترلی (کاملا بالاتر از دکمه‌های سیستم)
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier.fillMaxWidth()
@@ -442,7 +450,7 @@ fun RakatCounterApp() {
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(12.dp)
                 ) {
-                    Text("برگشت ۱ سجده", fontSize = 13.sp)
+                    Text("برگشت", fontSize = 13.sp)
                 }
 
                 Button(
