@@ -8,11 +8,11 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
-import android.media.AudioManager
-import android.media.ToneGenerator
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
+import android.view.SoundEffectConstants
+import android.view.View
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -38,6 +38,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.LayoutDirection
@@ -199,8 +200,8 @@ private fun resolvePrayerDisplayState(
     val lastSujoodRakat = ((safeSujoodCount - 1).coerceAtLeast(0) / 2) + 1
     val isSecondSujood = safeSujoodCount > 0 && safeSujoodCount % 2 == 0
 
-    // نمایش خودکار رکعت بعدی بدون فلش سجده پس از اتمام تایمر
-    if (!isSecondSujood && autoAdvancedRakat > lastSujoodRakat) {
+    // اگر تایمر پس از سجده دوم تمام شده باشد، رکعت بعدی را بدون فلش سجده نمایش بده
+    if (isSecondSujood && autoAdvancedRakat > lastSujoodRakat) {
         val targetRakat = autoAdvancedRakat.coerceAtMost(totalRakatsOverall)
         if (prayer == PrayerType.NIGHT_PRAYER || prayer == PrayerType.CUSTOM) {
             val sections = if (prayer == PrayerType.NIGHT_PRAYER) NightParts else customParts
@@ -243,7 +244,7 @@ private fun resolvePrayerDisplayState(
         } ?: sections.last()
         val rakatInPart = activeRakat - part.startRakatGlobal + 1
 
-        val waitSec = if (isSecondSujood) {
+        val waitSec = if (isSecondSujood && autoAdvancedRakat <= lastSujoodRakat) {
             if (isLastSujood || hasTashahhudOrSalam(prayer, rakatInPart, part.rakatCount)) {
                 withTashahhudSec
             } else {
@@ -263,7 +264,7 @@ private fun resolvePrayerDisplayState(
             isLastSujoodOfPrayer = isLastSujood
         )
     } else {
-        val waitSec = if (isSecondSujood) {
+        val waitSec = if (isSecondSujood && autoAdvancedRakat <= lastSujoodRakat) {
             if (isLastSujood || hasTashahhudOrSalam(prayer, activeRakat, totalRakatsOverall)) {
                 withTashahhudSec
             } else {
@@ -316,9 +317,17 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private fun playKeyboardTick(view: View) {
+    try {
+        view.playSoundEffect(SoundEffectConstants.CLICK)
+    } catch (_: Exception) {
+    }
+}
+
 @Composable
 fun RakatCounterApp() {
     val context = LocalContext.current
+    val view = LocalView.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val prefs = remember {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -330,31 +339,6 @@ fun RakatCounterApp() {
 
     val proximitySensor = remember {
         sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY)
-    }
-
-    // صدای تیک کیبورد
-    val toneGenerator = remember {
-        try {
-            ToneGenerator(AudioManager.STREAM_NOTIFICATION, 90)
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    DisposableEffect(toneGenerator) {
-        onDispose {
-            try {
-                toneGenerator?.release()
-            } catch (_: Exception) {
-            }
-        }
-    }
-
-    fun playKeyboardClick() {
-        try {
-            toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP, 45)
-        } catch (_: Exception) {
-        }
     }
 
     var selectedPrayer by remember {
@@ -373,7 +357,6 @@ fun RakatCounterApp() {
         mutableStateOf(false)
     }
 
-    // زمان‌های ذخیره‌شده در حافظه گوشی
     var noTashahhudSeconds by remember {
         mutableIntStateOf(prefs.getInt(KEY_NO_TASHAHHUD, 5).coerceIn(1, 120))
     }
@@ -382,7 +365,6 @@ fun RakatCounterApp() {
         mutableIntStateOf(prefs.getInt(KEY_WITH_TASHAHHUD, 15).coerceIn(1, 180))
     }
 
-    // تنظیمات نماز دلخواه (پیش‌فرض: ۶ نماز ۲ رکعتی = ۱۲ رکعت)
     var customPrayerCount by remember {
         mutableIntStateOf(prefs.getInt(KEY_CUSTOM_PRAYERS, 6).coerceIn(1, 30))
     }
@@ -445,10 +427,11 @@ fun RakatCounterApp() {
         prayerFinishedFlag = false
     }
 
-    // تایمر خودکار پس از سجده دوم هر رکعت (شامل انتظار تشهد/سلام پس از آخرین سجده نماز)
+    // تایمر خودکار پس از سجده دوم هر رکعت
     LaunchedEffect(
         selectedPrayer,
         sujoodCount,
+        autoAdvancedRakat,
         noTashahhudSeconds,
         withTashahhudSeconds,
         prayerFinishedFlag
@@ -459,12 +442,12 @@ fun RakatCounterApp() {
 
             if (displayState.isLastSujoodOfPrayer) {
                 prayerFinishedFlag = true
-                playKeyboardClick()
+                playKeyboardTick(view)
             } else {
                 val currentRakat = sujoodCount / 2
                 if (currentRakat < totalRakatsOverall) {
                     autoAdvancedRakat = currentRakat + 1
-                    playKeyboardClick()
+                    playKeyboardTick(view)
                 }
             }
         }
@@ -486,7 +469,7 @@ fun RakatCounterApp() {
                 sujoodCount = (sujoodCount + 1).coerceAtMost(maxSujood)
                 autoAdvancedRakat = 0
                 lastCountTime.set(now)
-                playKeyboardClick()
+                playKeyboardTick(view)
             }
         }
     }
@@ -707,7 +690,6 @@ fun RakatCounterApp() {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.SpaceBetween
     ) {
-        // نوار بالای صفحه
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -759,7 +741,6 @@ fun RakatCounterApp() {
             }
         }
 
-        // قاب محراب طلایی وسط صفحه با جای ثابت برای هر بخش
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -843,7 +824,6 @@ fun RakatCounterApp() {
                             horizontalAlignment = Alignment.CenterHorizontally,
                             verticalArrangement = Arrangement.SpaceEvenly
                         ) {
-                            // جایگاه ثابت عنوان نماز / بخش
                             Text(
                                 text = displayState.sectionTitle ?: selectedPrayer.title,
                                 color = GoldSoft,
@@ -852,7 +832,6 @@ fun RakatCounterApp() {
                                 textAlign = TextAlign.Center
                             )
 
-                            // جایگاه ثابت متن و فلش رکعت
                             Column(
                                 horizontalAlignment = Alignment.CenterHorizontally
                             ) {
@@ -866,7 +845,6 @@ fun RakatCounterApp() {
                                 RakatArrowRow(count = displayState.rakatInSection)
                             }
 
-                            // جایگاه ثابت مثلث و متن سجده
                             Box(
                                 modifier = Modifier.height(86.dp),
                                 contentAlignment = Alignment.Center
@@ -887,7 +865,6 @@ fun RakatCounterApp() {
                                 }
                             }
 
-                            // جایگاه ثابت رکعت کل در نمازهای چندبخشی
                             if (selectedPrayer == PrayerType.NIGHT_PRAYER || selectedPrayer == PrayerType.CUSTOM) {
                                 Text(
                                     text = "کل: رکعت ${displayState.totalRakatGlobal} از ${displayState.totalRakatsOverall}",
@@ -904,12 +881,10 @@ fun RakatCounterApp() {
             }
         }
 
-        // بخش پایینی صفحه: دکمه‌های کمکی، انتخاب نماز و نماز دلخواه
         Column(
             modifier = Modifier.fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // دکمه‌های کمکی (ثبت دستی / برگشت / شروع مجدد)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -919,7 +894,7 @@ fun RakatCounterApp() {
                         if (!prayerFinishedFlag) {
                             sujoodCount = (sujoodCount + 1).coerceAtMost(maxSujood)
                             autoAdvancedRakat = 0
-                            playKeyboardClick()
+                            playKeyboardTick(view)
                         }
                     },
                     border = BorderStroke(1.dp, GoldAccent),
@@ -960,7 +935,6 @@ fun RakatCounterApp() {
                 }
             }
 
-            // دکمه‌های انتخاب نماز در پایین صفحه
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -1007,7 +981,6 @@ fun RakatCounterApp() {
                 }
             }
 
-            // دکمه بزرگ نماز دلخواه در زیر دکمه‌های انتخاب نماز
             val isCustomSelected = selectedPrayer == PrayerType.CUSTOM
             val customButtonLabel = customPrayerTitle.trim().ifEmpty { PrayerType.CUSTOM.title }
             Button(
@@ -1101,7 +1074,6 @@ private fun CustomPrayerDialog(
                     fontWeight = FontWeight.Medium
                 )
                 Spacer(modifier = Modifier.height(8.dp))
-                // در RTL فرزند اول سمت راست (+) و فرزند دوم سمت چپ (-) است
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
@@ -1173,20 +1145,20 @@ private fun CustomPrayerDialog(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    OutlinedButton(
-                        onClick = onDismiss,
-                        border = BorderStroke(1.dp, Color.Gray),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("لغو", color = Color.LightGray, fontSize = 15.sp)
-                    }
-
                     Button(
                         onClick = { onConfirm(prayerTitle, prayerCount, rakatsPerPrayer) },
                         colors = ButtonDefaults.buttonColors(containerColor = GoldAccent),
                         modifier = Modifier.weight(1f)
                     ) {
                         Text("شروع", color = PureBlack, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                    }
+
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        border = BorderStroke(1.dp, Color.Gray),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("لغو", color = Color.LightGray, fontSize = 15.sp)
                     }
                 }
             }
@@ -1235,7 +1207,6 @@ private fun TimingSettingsDialog(
                     fontWeight = FontWeight.Medium
                 )
                 Spacer(modifier = Modifier.height(8.dp))
-                // در RTL فرزند اول سمت راست (+) و فرزند دوم سمت چپ (-) است
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
@@ -1299,20 +1270,20 @@ private fun TimingSettingsDialog(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    OutlinedButton(
-                        onClick = onDismiss,
-                        border = BorderStroke(1.dp, Color.Gray),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text("لغو", color = Color.LightGray, fontSize = 15.sp)
-                    }
-
                     Button(
                         onClick = { onSave(noTashahhud, withTashahhud) },
                         colors = ButtonDefaults.buttonColors(containerColor = GoldAccent),
                         modifier = Modifier.weight(1f)
                     ) {
                         Text("ذخیره", color = PureBlack, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                    }
+
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        border = BorderStroke(1.dp, Color.Gray),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("لغو", color = Color.LightGray, fontSize = 15.sp)
                     }
                 }
             }
