@@ -8,11 +8,11 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
-import android.view.SoundEffectConstants
-import android.view.View
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -38,7 +38,6 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalLifecycleOwner
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.LayoutDirection
@@ -200,7 +199,6 @@ private fun resolvePrayerDisplayState(
     val lastSujoodRakat = ((safeSujoodCount - 1).coerceAtLeast(0) / 2) + 1
     val isSecondSujood = safeSujoodCount > 0 && safeSujoodCount % 2 == 0
 
-    // اگر تایمر پس از سجده دوم تمام شده باشد، رکعت بعدی را بدون فلش سجده نمایش بده
     if (isSecondSujood && autoAdvancedRakat > lastSujoodRakat) {
         val targetRakat = autoAdvancedRakat.coerceAtMost(totalRakatsOverall)
         if (prayer == PrayerType.NIGHT_PRAYER || prayer == PrayerType.CUSTOM) {
@@ -317,17 +315,31 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private fun playKeyboardTick(view: View) {
-    try {
-        view.playSoundEffect(SoundEffectConstants.CLICK)
+private class KeyClickSoundPlayer {
+    private val toneGenerator: ToneGenerator? = try {
+        ToneGenerator(AudioManager.STREAM_MUSIC, 100)
     } catch (_: Exception) {
+        null
+    }
+
+    fun playTick() {
+        try {
+            toneGenerator?.startTone(ToneGenerator.TONE_PROP_PROMPT, 28)
+        } catch (_: Exception) {
+        }
+    }
+
+    fun release() {
+        try {
+            toneGenerator?.release()
+        } catch (_: Exception) {
+        }
     }
 }
 
 @Composable
 fun RakatCounterApp() {
     val context = LocalContext.current
-    val view = LocalView.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val prefs = remember {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -339,6 +351,16 @@ fun RakatCounterApp() {
 
     val proximitySensor = remember {
         sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY)
+    }
+
+    val clickPlayer = remember {
+        KeyClickSoundPlayer()
+    }
+
+    DisposableEffect(clickPlayer) {
+        onDispose {
+            clickPlayer.release()
+        }
     }
 
     var selectedPrayer by remember {
@@ -427,7 +449,6 @@ fun RakatCounterApp() {
         prayerFinishedFlag = false
     }
 
-    // تایمر خودکار پس از سجده دوم هر رکعت
     LaunchedEffect(
         selectedPrayer,
         sujoodCount,
@@ -442,12 +463,12 @@ fun RakatCounterApp() {
 
             if (displayState.isLastSujoodOfPrayer) {
                 prayerFinishedFlag = true
-                playKeyboardTick(view)
+                clickPlayer.playTick()
             } else {
                 val currentRakat = sujoodCount / 2
                 if (currentRakat < totalRakatsOverall) {
                     autoAdvancedRakat = currentRakat + 1
-                    playKeyboardTick(view)
+                    clickPlayer.playTick()
                 }
             }
         }
@@ -469,7 +490,7 @@ fun RakatCounterApp() {
                 sujoodCount = (sujoodCount + 1).coerceAtMost(maxSujood)
                 autoAdvancedRakat = 0
                 lastCountTime.set(now)
-                playKeyboardTick(view)
+                clickPlayer.playTick()
             }
         }
     }
@@ -894,7 +915,7 @@ fun RakatCounterApp() {
                         if (!prayerFinishedFlag) {
                             sujoodCount = (sujoodCount + 1).coerceAtMost(maxSujood)
                             autoAdvancedRakat = 0
-                            playKeyboardTick(view)
+                            clickPlayer.playTick()
                         }
                     },
                     border = BorderStroke(1.dp, GoldAccent),
