@@ -60,6 +60,7 @@ private const val KEY_NO_TASHAHHUD = "no_tashahhud_seconds"
 private const val KEY_WITH_TASHAHHUD = "with_tashahhud_seconds"
 private const val KEY_CUSTOM_PRAYERS = "custom_prayer_count"
 private const val KEY_CUSTOM_RAKATS = "custom_rakats_per_prayer"
+private const val KEY_CUSTOM_TITLE = "custom_prayer_title"
 
 enum class PrayerType(val title: String, val totalRakats: Int) {
     FAJR("نماز صبح", 2),
@@ -154,43 +155,52 @@ private fun resolvePrayerDisplayState(
     noTashahhudSec: Int,
     withTashahhudSec: Int,
     customParts: List<MultiPartSection>,
+    customPrayerName: String,
     prayerFinishedFlag: Boolean
 ): PrayerDisplayState {
+    val effectivePrayerTitle = if (prayer == PrayerType.CUSTOM) {
+        customPrayerName.trim().ifEmpty { PrayerType.CUSTOM.title }
+    } else {
+        prayer.title
+    }
+
     val totalRakatsOverall = when (prayer) {
         PrayerType.CUSTOM -> customParts.sumOf { it.rakatCount }.coerceAtLeast(1)
         else -> prayer.totalRakats
     }
     val maxSujood = totalRakatsOverall * 2
 
-    if (prayerFinishedFlag || sujoodCount >= maxSujood) {
+    if (prayerFinishedFlag) {
         return PrayerDisplayState(
             mode = DisplayMode.FINISHED,
             rakatInSection = totalRakatsOverall,
             totalRakatGlobal = totalRakatsOverall,
             totalRakatsOverall = totalRakatsOverall,
-            sectionTitle = prayer.title,
+            sectionTitle = effectivePrayerTitle,
             waitAfterSecondSujoodSeconds = null,
             isLastSujoodOfPrayer = false
         )
     }
 
-    if (sujoodCount == 0 && autoAdvancedRakat <= 1) {
+    val safeSujoodCount = sujoodCount.coerceIn(0, maxSujood)
+
+    if (safeSujoodCount == 0 && autoAdvancedRakat <= 1) {
         return PrayerDisplayState(
             mode = DisplayMode.ALLAH_AKBAR,
             rakatInSection = 1,
             totalRakatGlobal = 1,
             totalRakatsOverall = totalRakatsOverall,
-            sectionTitle = prayer.title,
+            sectionTitle = effectivePrayerTitle,
             waitAfterSecondSujoodSeconds = null,
             isLastSujoodOfPrayer = false
         )
     }
 
-    val lastSujoodRakat = ((sujoodCount - 1).coerceAtLeast(0) / 2) + 1
-    val isSecondSujood = sujoodCount > 0 && sujoodCount % 2 == 0
+    val lastSujoodRakat = ((safeSujoodCount - 1).coerceAtLeast(0) / 2) + 1
+    val isSecondSujood = safeSujoodCount > 0 && safeSujoodCount % 2 == 0
 
     // نمایش خودکار رکعت بعدی بدون فلش سجده پس از اتمام تایمر
-    if (autoAdvancedRakat > lastSujoodRakat && sujoodCount % 2 == 0) {
+    if (!isSecondSujood && autoAdvancedRakat > lastSujoodRakat) {
         val targetRakat = autoAdvancedRakat.coerceAtMost(totalRakatsOverall)
         if (prayer == PrayerType.NIGHT_PRAYER || prayer == PrayerType.CUSTOM) {
             val sections = if (prayer == PrayerType.NIGHT_PRAYER) NightParts else customParts
@@ -214,7 +224,7 @@ private fun resolvePrayerDisplayState(
                 rakatInSection = targetRakat,
                 totalRakatGlobal = targetRakat,
                 totalRakatsOverall = totalRakatsOverall,
-                sectionTitle = prayer.title,
+                sectionTitle = effectivePrayerTitle,
                 waitAfterSecondSujoodSeconds = null,
                 isLastSujoodOfPrayer = false
             )
@@ -223,7 +233,7 @@ private fun resolvePrayerDisplayState(
 
     val activeRakat = lastSujoodRakat.coerceAtMost(totalRakatsOverall)
     val mode = if (isSecondSujood) DisplayMode.SUJOOD_SECOND else DisplayMode.SUJOOD_FIRST
-    val isLastSujood = isSecondSujood && sujoodCount == maxSujood
+    val isLastSujood = isSecondSujood && safeSujoodCount == maxSujood
 
     if (prayer == PrayerType.NIGHT_PRAYER || prayer == PrayerType.CUSTOM) {
         val sections = if (prayer == PrayerType.NIGHT_PRAYER) NightParts else customParts
@@ -268,7 +278,7 @@ private fun resolvePrayerDisplayState(
             rakatInSection = activeRakat,
             totalRakatGlobal = activeRakat,
             totalRakatsOverall = totalRakatsOverall,
-            sectionTitle = prayer.title,
+            sectionTitle = effectivePrayerTitle,
             waitAfterSecondSujoodSeconds = waitSec,
             isLastSujoodOfPrayer = isLastSujood
         )
@@ -381,6 +391,10 @@ fun RakatCounterApp() {
         mutableIntStateOf(prefs.getInt(KEY_CUSTOM_RAKATS, 2).coerceIn(1, 8))
     }
 
+    var customPrayerTitle by remember {
+        mutableStateOf(prefs.getString(KEY_CUSTOM_TITLE, PrayerType.CUSTOM.title) ?: PrayerType.CUSTOM.title)
+    }
+
     val customParts = remember(customPrayerCount, customRakatsPerPrayer) {
         buildCustomParts(customPrayerCount, customRakatsPerPrayer)
     }
@@ -410,6 +424,7 @@ fun RakatCounterApp() {
         noTashahhudSeconds,
         withTashahhudSeconds,
         customParts,
+        customPrayerTitle,
         prayerFinishedFlag
     ) {
         resolvePrayerDisplayState(
@@ -419,6 +434,7 @@ fun RakatCounterApp() {
             noTashahhudSec = noTashahhudSeconds,
             withTashahhudSec = withTashahhudSeconds,
             customParts = customParts,
+            customPrayerName = customPrayerTitle,
             prayerFinishedFlag = prayerFinishedFlag
         )
     }
@@ -659,13 +675,17 @@ fun RakatCounterApp() {
 
     if (showCustomPrayerDialog) {
         CustomPrayerDialog(
+            initialTitle = customPrayerTitle,
             initialPrayerCount = customPrayerCount,
             initialRakatsPerPrayer = customRakatsPerPrayer,
             onDismiss = { showCustomPrayerDialog = false },
-            onConfirm = { newPrayers, newRakats ->
+            onConfirm = { newTitle, newPrayers, newRakats ->
+                val cleanTitle = newTitle.trim().ifEmpty { PrayerType.CUSTOM.title }
+                customPrayerTitle = cleanTitle
                 customPrayerCount = newPrayers
                 customRakatsPerPrayer = newRakats
                 prefs.edit()
+                    .putString(KEY_CUSTOM_TITLE, cleanTitle)
                     .putInt(KEY_CUSTOM_PRAYERS, newPrayers)
                     .putInt(KEY_CUSTOM_RAKATS, newRakats)
                     .apply()
@@ -846,7 +866,7 @@ fun RakatCounterApp() {
                                 RakatArrowRow(count = displayState.rakatInSection)
                             }
 
-                            // جایگاه ثابت مثلث و متن سجده (حتی وقتی فلش سجده نمایش داده نمی‌شود)
+                            // جایگاه ثابت مثلث و متن سجده
                             Box(
                                 modifier = Modifier.height(86.dp),
                                 contentAlignment = Alignment.Center
@@ -889,24 +909,6 @@ fun RakatCounterApp() {
             modifier = Modifier.fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // نوار زمان‌های تنظیم‌شده
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(CardDark)
-                    .padding(vertical = 7.dp, horizontal = 10.dp)
-            ) {
-                Text(
-                    text = "بدون تشهد/سلام: ${noTashahhudSeconds}s  •  با تشهد/سلام: ${withTashahhudSeconds}s",
-                    color = Color.LightGray,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Medium,
-                    textAlign = TextAlign.Center
-                )
-            }
-
             // دکمه‌های کمکی (ثبت دستی / برگشت / شروع مجدد)
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1007,6 +1009,7 @@ fun RakatCounterApp() {
 
             // دکمه بزرگ نماز دلخواه در زیر دکمه‌های انتخاب نماز
             val isCustomSelected = selectedPrayer == PrayerType.CUSTOM
+            val customButtonLabel = customPrayerTitle.trim().ifEmpty { PrayerType.CUSTOM.title }
             Button(
                 onClick = { showCustomPrayerDialog = true },
                 colors = ButtonDefaults.buttonColors(
@@ -1023,9 +1026,9 @@ fun RakatCounterApp() {
             ) {
                 Text(
                     text = if (isCustomSelected) {
-                        "نماز دلخواه ($customPrayerCount نماز × $customRakatsPerPrayer رکعت)"
+                        "$customButtonLabel ($customPrayerCount نماز × $customRakatsPerPrayer رکعت)"
                     } else {
-                        "نماز دلخواه"
+                        customButtonLabel
                     },
                     color = if (isCustomSelected) PureBlack else GoldSoft,
                     fontSize = 16.sp,
@@ -1038,11 +1041,15 @@ fun RakatCounterApp() {
 
 @Composable
 private fun CustomPrayerDialog(
+    initialTitle: String,
     initialPrayerCount: Int,
     initialRakatsPerPrayer: Int,
     onDismiss: () -> Unit,
-    onConfirm: (Int, Int) -> Unit
+    onConfirm: (String, Int, Int) -> Unit
 ) {
+    var prayerTitle by remember(initialTitle) {
+        mutableStateOf(initialTitle)
+    }
     var prayerCount by remember(initialPrayerCount) {
         mutableIntStateOf(initialPrayerCount)
     }
@@ -1068,7 +1075,24 @@ private fun CustomPrayerDialog(
                     fontWeight = FontWeight.Bold
                 )
 
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(12.dp))
+
+                OutlinedTextField(
+                    value = prayerTitle,
+                    onValueChange = { prayerTitle = it },
+                    label = { Text("نام نماز", color = Color.LightGray) },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedBorderColor = GoldSoft,
+                        unfocusedBorderColor = GoldAccent.copy(alpha = 0.7f),
+                        cursorColor = GoldSoft
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Spacer(modifier = Modifier.height(14.dp))
 
                 Text(
                     text = "چند نماز؟",
@@ -1077,15 +1101,16 @@ private fun CustomPrayerDialog(
                     fontWeight = FontWeight.Medium
                 )
                 Spacer(modifier = Modifier.height(8.dp))
+                // در RTL فرزند اول سمت راست (+) و فرزند دوم سمت چپ (-) است
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
                     OutlinedButton(
-                        onClick = { if (prayerCount > 1) prayerCount-- },
+                        onClick = { if (prayerCount < 30) prayerCount++ },
                         border = BorderStroke(1.dp, GoldAccent)
                     ) {
-                        Text("-", color = Color.White, fontSize = 20.sp)
+                        Text("+", color = Color.White, fontSize = 20.sp)
                     }
                     Text(
                         text = "$prayerCount نماز",
@@ -1094,14 +1119,14 @@ private fun CustomPrayerDialog(
                         fontWeight = FontWeight.Bold
                     )
                     OutlinedButton(
-                        onClick = { if (prayerCount < 30) prayerCount++ },
+                        onClick = { if (prayerCount > 1) prayerCount-- },
                         border = BorderStroke(1.dp, GoldAccent)
                     ) {
-                        Text("+", color = Color.White, fontSize = 20.sp)
+                        Text("-", color = Color.White, fontSize = 20.sp)
                     }
                 }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(14.dp))
 
                 Text(
                     text = "هر نماز چند رکعت؟",
@@ -1115,10 +1140,10 @@ private fun CustomPrayerDialog(
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
                     OutlinedButton(
-                        onClick = { if (rakatsPerPrayer > 1) rakatsPerPrayer-- },
+                        onClick = { if (rakatsPerPrayer < 8) rakatsPerPrayer++ },
                         border = BorderStroke(1.dp, GoldAccent)
                     ) {
-                        Text("-", color = Color.White, fontSize = 20.sp)
+                        Text("+", color = Color.White, fontSize = 20.sp)
                     }
                     Text(
                         text = "$rakatsPerPrayer رکعتی",
@@ -1127,10 +1152,10 @@ private fun CustomPrayerDialog(
                         fontWeight = FontWeight.Bold
                     )
                     OutlinedButton(
-                        onClick = { if (rakatsPerPrayer < 8) rakatsPerPrayer++ },
+                        onClick = { if (rakatsPerPrayer > 1) rakatsPerPrayer-- },
                         border = BorderStroke(1.dp, GoldAccent)
                     ) {
-                        Text("+", color = Color.White, fontSize = 20.sp)
+                        Text("-", color = Color.White, fontSize = 20.sp)
                     }
                 }
 
@@ -1142,7 +1167,7 @@ private fun CustomPrayerDialog(
                     fontSize = 15.sp
                 )
 
-                Spacer(modifier = Modifier.height(20.dp))
+                Spacer(modifier = Modifier.height(18.dp))
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1157,7 +1182,7 @@ private fun CustomPrayerDialog(
                     }
 
                     Button(
-                        onClick = { onConfirm(prayerCount, rakatsPerPrayer) },
+                        onClick = { onConfirm(prayerTitle, prayerCount, rakatsPerPrayer) },
                         colors = ButtonDefaults.buttonColors(containerColor = GoldAccent),
                         modifier = Modifier.weight(1f)
                     ) {
@@ -1210,15 +1235,16 @@ private fun TimingSettingsDialog(
                     fontWeight = FontWeight.Medium
                 )
                 Spacer(modifier = Modifier.height(8.dp))
+                // در RTL فرزند اول سمت راست (+) و فرزند دوم سمت چپ (-) است
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
                     OutlinedButton(
-                        onClick = { if (noTashahhud > 1) noTashahhud-- },
+                        onClick = { if (noTashahhud < 120) noTashahhud++ },
                         border = BorderStroke(1.dp, GoldAccent)
                     ) {
-                        Text("-", color = Color.White, fontSize = 20.sp)
+                        Text("+", color = Color.White, fontSize = 20.sp)
                     }
                     Text(
                         text = "$noTashahhud ثانیه",
@@ -1227,10 +1253,10 @@ private fun TimingSettingsDialog(
                         fontWeight = FontWeight.Bold
                     )
                     OutlinedButton(
-                        onClick = { if (noTashahhud < 120) noTashahhud++ },
+                        onClick = { if (noTashahhud > 1) noTashahhud-- },
                         border = BorderStroke(1.dp, GoldAccent)
                     ) {
-                        Text("+", color = Color.White, fontSize = 20.sp)
+                        Text("-", color = Color.White, fontSize = 20.sp)
                     }
                 }
 
@@ -1248,10 +1274,10 @@ private fun TimingSettingsDialog(
                     horizontalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
                     OutlinedButton(
-                        onClick = { if (withTashahhud > 1) withTashahhud-- },
+                        onClick = { if (withTashahhud < 180) withTashahhud++ },
                         border = BorderStroke(1.dp, GoldAccent)
                     ) {
-                        Text("-", color = Color.White, fontSize = 20.sp)
+                        Text("+", color = Color.White, fontSize = 20.sp)
                     }
                     Text(
                         text = "$withTashahhud ثانیه",
@@ -1260,10 +1286,10 @@ private fun TimingSettingsDialog(
                         fontWeight = FontWeight.Bold
                     )
                     OutlinedButton(
-                        onClick = { if (withTashahhud < 180) withTashahhud++ },
+                        onClick = { if (withTashahhud > 1) withTashahhud-- },
                         border = BorderStroke(1.dp, GoldAccent)
                     ) {
-                        Text("+", color = Color.White, fontSize = 20.sp)
+                        Text("-", color = Color.White, fontSize = 20.sp)
                     }
                 }
 
