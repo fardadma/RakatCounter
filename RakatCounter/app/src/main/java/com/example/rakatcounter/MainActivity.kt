@@ -8,12 +8,11 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.os.VibratorManager
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -33,6 +32,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -45,8 +45,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import kotlinx.coroutines.delay
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -64,15 +66,37 @@ enum class PrayerType(val title: String, val totalRakats: Int) {
     NIGHT_PRAYER("نماز شب", 11)
 }
 
-data class NightPrayerState(
-    val prayerName: String,
-    val rakatInPart: String,
-    val rakatNumberInPart: Int,
-    val sujoodInRakat: String,
-    val sujoodNumberInRakat: Int,
-    val totalRakatNumber: Int,
-    val isPartEnd: Boolean,
-    val isAllFinished: Boolean
+private enum class DisplayMode {
+    ALLAH_AKBAR,
+    RAKAT_ONLY,
+    SUJOOD_FIRST,
+    SUJOOD_SECOND,
+    FINISHED
+}
+
+private data class NightPartInfo(
+    val partIndex: Int, // 0..5 (0..3: اول..چهارم، 4: شفع، 5: وتر)
+    val title: String,
+    val rakatCount: Int,
+    val startRakatGlobal: Int,
+    val hasTashahhudOrSalamAfterSecondSujood: Boolean
+)
+
+private val NightParts = listOf(
+    NightPartInfo(0, "نماز اول", 2, 1, true),
+    NightPartInfo(1, "نماز دوم", 2, 3, true),
+    NightPartInfo(2, "نماز سوم", 2, 5, true),
+    NightPartInfo(3, "نماز چهارم", 2, 7, true),
+    NightPartInfo(4, "نماز شفع", 2, 9, true),
+    NightPartInfo(5, "نماز وتر", 1, 11, true)
+)
+
+private data class PrayerDisplayState(
+    val mode: DisplayMode,
+    val rakatInSection: Int,
+    val totalRakatGlobal: Int,
+    val sectionTitle: String?,
+    val waitAfterSecondSujoodSeconds: Int?
 )
 
 private fun ordinalPersian(num: Int): String = when (num) {
@@ -83,58 +107,118 @@ private fun ordinalPersian(num: Int): String = when (num) {
     else -> num.toString()
 }
 
-private fun resolveNightPrayerState(totalSujood: Int): NightPrayerState {
-    val maxSujood = 22
-    val count = totalSujood.coerceIn(0, maxSujood)
-    val finished = count >= maxSujood
-    val effective = if (finished) maxSujood - 1 else count
+private fun hasTashahhudOrSalam(prayer: PrayerType, rakatInSection: Int): Boolean {
+    return when (prayer) {
+        PrayerType.FAJR -> rakatInSection == 2
+        PrayerType.DHUHR, PrayerType.ASR, PrayerType.ISHA -> rakatInSection == 2 || rakatInSection == 4
+        PrayerType.MAGHRIB -> rakatInSection == 2 || rakatInSection == 3
+        PrayerType.NIGHT_PRAYER -> rakatInSection == 2 || rakatInSection == 1
+    }
+}
 
-    val rakatIndex = effective / 2
-    val sujoodIndex = effective % 2
-    val totalRakat = rakatIndex + 1
-    val sujoodLabel = if (sujoodIndex == 0) "سجده اول" else "سجده دوم"
+private fun resolvePrayerDisplayState(
+    prayer: PrayerType,
+    sujoodCount: Int,
+    autoAdvancedRakat: Int,
+    noTashahhudSec: Int,
+    withTashahhudSec: Int
+): PrayerDisplayState {
+    val maxSujood = prayer.totalRakats * 2
 
-    return when {
-        rakatIndex < 8 -> {
-            val part = (rakatIndex / 2) + 1
-            val rakat = (rakatIndex % 2) + 1
+    if (sujoodCount >= maxSujood) {
+        return PrayerDisplayState(
+            mode = DisplayMode.FINISHED,
+            rakatInSection = prayer.totalRakats,
+            totalRakatGlobal = prayer.totalRakats,
+            sectionTitle = null,
+            waitAfterSecondSujoodSeconds = null
+        )
+    }
 
-            NightPrayerState(
-                prayerName = "نماز ${ordinalPersian(part)}",
-                rakatInPart = "رکعت ${ordinalPersian(rakat)}",
-                rakatNumberInPart = rakat,
-                sujoodInRakat = sujoodLabel,
-                sujoodNumberInRakat = sujoodIndex + 1,
-                totalRakatNumber = totalRakat,
-                isPartEnd = rakat == 2 && sujoodIndex == 1,
-                isAllFinished = false
+    if (sujoodCount == 0 && autoAdvancedRakat <= 1) {
+        return PrayerDisplayState(
+            mode = DisplayMode.ALLAH_AKBAR,
+            rakatInSection = 1,
+            totalRakatGlobal = 1,
+            sectionTitle = null,
+            waitAfterSecondSujoodSeconds = null
+        )
+    }
+
+    val lastSujoodRakat = ((sujoodCount - 1).coerceAtLeast(0) / 2) + 1
+    val isSecondSujood = sujoodCount > 0 && sujoodCount % 2 == 0
+
+    // اگر تایمر خودکار رکعت بعدی را جلو برده و هنوز سجده جدیدی برای آن ثبت نشده است
+    if (autoAdvancedRakat > lastSujoodRakat && sujoodCount % 2 == 0) {
+        val targetRakat = autoAdvancedRakat.coerceAtMost(prayer.totalRakats)
+        if (prayer == PrayerType.NIGHT_PRAYER) {
+            val part = NightParts.firstOrNull {
+                targetRakat >= it.startRakatGlobal &&
+                    targetRakat < it.startRakatGlobal + it.rakatCount
+            } ?: NightParts.last()
+            val rakatInPart = targetRakat - part.startRakatGlobal + 1
+            return PrayerDisplayState(
+                mode = DisplayMode.RAKAT_ONLY,
+                rakatInSection = rakatInPart,
+                totalRakatGlobal = targetRakat,
+                sectionTitle = part.title,
+                waitAfterSecondSujoodSeconds = null
+            )
+        } else {
+            return PrayerDisplayState(
+                mode = DisplayMode.RAKAT_ONLY,
+                rakatInSection = targetRakat,
+                totalRakatGlobal = targetRakat,
+                sectionTitle = null,
+                waitAfterSecondSujoodSeconds = null
             )
         }
+    }
 
-        rakatIndex < 10 -> {
-            val rakat = (rakatIndex - 8) + 1
+    val activeRakat = lastSujoodRakat.coerceAtMost(prayer.totalRakats)
+    val mode = if (isSecondSujood) DisplayMode.SUJOOD_SECOND else DisplayMode.SUJOOD_FIRST
 
-            NightPrayerState(
-                prayerName = "نماز شفع",
-                rakatInPart = "رکعت ${ordinalPersian(rakat)}",
-                rakatNumberInPart = rakat,
-                sujoodInRakat = sujoodLabel,
-                sujoodNumberInRakat = sujoodIndex + 1,
-                totalRakatNumber = totalRakat,
-                isPartEnd = rakat == 2 && sujoodIndex == 1,
-                isAllFinished = false
-            )
+    if (prayer == PrayerType.NIGHT_PRAYER) {
+        val part = NightParts.firstOrNull {
+            activeRakat >= it.startRakatGlobal &&
+                activeRakat < it.startRakatGlobal + it.rakatCount
+        } ?: NightParts.last()
+        val rakatInPart = activeRakat - part.startRakatGlobal + 1
+
+        val waitSec = if (isSecondSujood) {
+            if (part.hasTashahhudOrSalamAfterSecondSujood && rakatInPart == part.rakatCount) {
+                withTashahhudSec
+            } else {
+                noTashahhudSec
+            }
+        } else {
+            null
         }
 
-        else -> NightPrayerState(
-            prayerName = "نماز وتر",
-            rakatInPart = "رکعت اول",
-            rakatNumberInPart = 1,
-            sujoodInRakat = sujoodLabel,
-            sujoodNumberInRakat = sujoodIndex + 1,
-            totalRakatNumber = totalRakat,
-            isPartEnd = sujoodIndex == 1,
-            isAllFinished = finished
+        return PrayerDisplayState(
+            mode = mode,
+            rakatInSection = rakatInPart,
+            totalRakatGlobal = activeRakat,
+            sectionTitle = part.title,
+            waitAfterSecondSujoodSeconds = waitSec
+        )
+    } else {
+        val waitSec = if (isSecondSujood) {
+            if (hasTashahhudOrSalam(prayer, activeRakat)) {
+                withTashahhudSec
+            } else {
+                noTashahhudSec
+            }
+        } else {
+            null
+        }
+
+        return PrayerDisplayState(
+            mode = mode,
+            rakatInSection = activeRakat,
+            totalRakatGlobal = activeRakat,
+            sectionTitle = null,
+            waitAfterSecondSujoodSeconds = waitSec
         )
     }
 }
@@ -183,12 +267,55 @@ fun RakatCounterApp() {
         sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY)
     }
 
+    // صدای تیک کیبورد (بدون نیاز به فایل خارجی)
+    val toneGenerator = remember {
+        try {
+            ToneGenerator(AudioManager.STREAM_NOTIFICATION, 85)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    DisposableEffect(toneGenerator) {
+        onDispose {
+            try {
+                toneGenerator?.release()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    fun playKeyboardClick() {
+        try {
+            toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP, 45)
+        } catch (_: Exception) {
+        }
+    }
+
     var selectedPrayer by remember {
         mutableStateOf(PrayerType.DHUHR)
     }
 
     var sujoodCount by remember {
         mutableIntStateOf(0)
+    }
+
+    // شماره رکعتی که پس از اتمام تایمر به‌صورت خودکار (بدون فلش سجده) نمایش داده می‌شود
+    var autoAdvancedRakat by remember {
+        mutableIntStateOf(0)
+    }
+
+    // تنظیمات زمان انتظار (ثانیه)
+    var noTashahhudSeconds by remember {
+        mutableIntStateOf(5)
+    }
+
+    var withTashahhudSeconds by remember {
+        mutableIntStateOf(15)
+    }
+
+    var showSettingsDialog by remember {
+        mutableStateOf(false)
     }
 
     var sensorActive by remember {
@@ -215,70 +342,53 @@ fun RakatCounterApp() {
         mutableStateOf("هنوز ثبت نشده")
     }
 
-    val isNightPrayer = selectedPrayer == PrayerType.NIGHT_PRAYER
     val maxSujood = selectedPrayer.totalRakats * 2
-    val completedRakats = sujoodCount / 2
-
-    val currentRakat = if (completedRakats < selectedPrayer.totalRakats) {
-        completedRakats + 1
-    } else {
-        selectedPrayer.totalRakats
-    }
-
     val isPrayerFinished = sujoodCount >= maxSujood
 
-    val currentSujoodStepInRakat = if (sujoodCount == 0) {
-        0
-    } else if (sujoodCount % 2 == 1) {
-        1
-    } else {
-        2
+    val displayState = remember(
+        selectedPrayer,
+        sujoodCount,
+        autoAdvancedRakat,
+        noTashahhudSeconds,
+        withTashahhudSeconds
+    ) {
+        resolvePrayerDisplayState(
+            prayer = selectedPrayer,
+            sujoodCount = sujoodCount,
+            autoAdvancedRakat = autoAdvancedRakat,
+            noTashahhudSec = noTashahhudSeconds,
+            withTashahhudSec = withTashahhudSeconds
+        )
     }
 
-    val nightState = remember(sujoodCount) {
-        resolveNightPrayerState(sujoodCount)
+    fun resetPrayerState() {
+        sujoodCount = 0
+        autoAdvancedRakat = 0
+        lastCountSource = "هنوز ثبت نشده"
     }
 
-    fun triggerVibration(strong: Boolean) {
-        try {
-            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val manager = context.getSystemService(
-                    Context.VIBRATOR_MANAGER_SERVICE
-                ) as VibratorManager
-                manager.defaultVibrator
-            } else {
-                @Suppress("DEPRECATION")
-                context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-            }
+    // تایمر خودکار پس از سجده دوم هر رکعت
+    LaunchedEffect(
+        selectedPrayer,
+        sujoodCount,
+        noTashahhudSeconds,
+        withTashahhudSeconds
+    ) {
+        val waitSec = displayState.waitAfterSecondSujoodSeconds
+        if (!isPrayerFinished && sujoodCount > 0 && sujoodCount % 2 == 0 && waitSec != null) {
+            delay(waitSec * 1000L)
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                if (strong) {
-                    vibrator.vibrate(
-                        VibrationEffect.createWaveform(
-                            longArrayOf(0, 180, 100, 180, 100, 180),
-                            -1
-                        )
-                    )
-                } else {
-                    vibrator.vibrate(
-                        VibrationEffect.createOneShot(
-                            100,
-                            VibrationEffect.DEFAULT_AMPLITUDE
-                        )
-                    )
-                }
+            val currentRakat = sujoodCount / 2
+            if (currentRakat >= selectedPrayer.totalRakats) {
+                sujoodCount = maxSujood
+                playKeyboardClick()
             } else {
-                @Suppress("DEPRECATION")
-                vibrator.vibrate(if (strong) 350 else 120)
+                autoAdvancedRakat = currentRakat + 1
+                playKeyboardClick()
             }
-        } catch (_: Exception) {
         }
     }
 
-    /*
-     * قفل مشترک برای جلوگیری از ثبت دوباره یک سجده
-     * توسط سنسور و رویداد خاموش شدن صفحه
-     */
     val countLock = remember { Any() }
     val lastCountTime = remember { AtomicLong(0L) }
     val nearAlreadyCounted = remember { AtomicBoolean(false) }
@@ -290,19 +400,13 @@ fun RakatCounterApp() {
 
             if (!isPrayerFinished &&
                 sujoodCount < maxSujood &&
-                now - previous >= 2200L
+                now - previous >= 1500L
             ) {
                 sujoodCount = (sujoodCount + 1).coerceAtMost(maxSujood)
+                autoAdvancedRakat = 0
                 lastCountTime.set(now)
                 lastCountSource = source
-
-                val strong = if (isNightPrayer) {
-                    resolveNightPrayerState(sujoodCount).isPartEnd
-                } else {
-                    sujoodCount % 2 == 0
-                }
-
-                triggerVibration(strong)
+                playKeyboardClick()
             }
         }
     }
@@ -361,11 +465,6 @@ fun RakatCounterApp() {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context?, intent: Intent?) {
                 if (intent?.action == Intent.ACTION_SCREEN_OFF) {
-                    /*
-                     * مسیر پشتیبان:
-                     * اگر سنسور هنوز NEAR را ثبت نکرده باشد،
-                     * خاموش شدن صفحه یک بار شمارش را انجام می‌دهد.
-                     */
                     if (nearAlreadyCounted.compareAndSet(false, true)) {
                         countSujood("خاموش شدن صفحه")
                     }
@@ -495,6 +594,19 @@ fun RakatCounterApp() {
         }
     }
 
+    if (showSettingsDialog) {
+        TimingSettingsDialog(
+            initialNoTashahhud = noTashahhudSeconds,
+            initialWithTashahhud = withTashahhudSeconds,
+            onDismiss = { showSettingsDialog = false },
+            onSave = { newNoTashahhud, newWithTashahhud ->
+                noTashahhudSeconds = newNoTashahhud
+                withTashahhudSeconds = newWithTashahhud
+                showSettingsDialog = false
+            }
+        )
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -528,12 +640,34 @@ fun RakatCounterApp() {
                 )
             }
 
-            Text(
-                text = if (sensorActive) "سنسور فعال" else "سنسور غیرفعال",
-                color = if (sensorActive) GoldSoft else Color(0xFFEF5350),
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Medium
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = if (sensorActive) "سنسور فعال" else "سنسور غیرفعال",
+                    color = if (sensorActive) GoldSoft else Color(0xFFEF5350),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium
+                )
+
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .border(1.dp, GoldAccent.copy(alpha = 0.7f), RoundedCornerShape(6.dp))
+                        .background(CardDark)
+                        .clickable { showSettingsDialog = true }
+                        .padding(horizontal = 10.dp, vertical = 5.dp)
+                ) {
+                    Text(
+                        text = "تنظیمات",
+                        color = GoldSoft,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
         }
 
         // قاب محراب طلایی وسط صفحه
@@ -550,8 +684,8 @@ fun RakatCounterApp() {
                     .fillMaxSize()
                     .padding(horizontal = 36.dp, vertical = 56.dp)
             ) {
-                when {
-                    isPrayerFinished -> {
+                when (displayState.mode) {
+                    DisplayMode.FINISHED -> {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Text(
                                 text = "التماس دعا",
@@ -570,7 +704,7 @@ fun RakatCounterApp() {
                         }
                     }
 
-                    sujoodCount == 0 -> {
+                    DisplayMode.ALLAH_AKBAR -> {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Text(
                                 text = "الله اکبر",
@@ -588,51 +722,75 @@ fun RakatCounterApp() {
                         }
                     }
 
-                    isNightPrayer -> {
-                        // در تمام طول هر ۲ رکعت (و رکعت واحدی وتر)، نام بخش بالای عبارت «رکعت چندم» ثابت می‌ماند
-                        val displayRakatLabel = if (sujoodCount % 2 == 0 && !nightState.isPartEnd) {
-                            "رکعت ${ordinalPersian(nightState.rakatNumberInPart + 1)}"
-                        } else {
-                            nightState.rakatInPart
-                        }
-                        val upArrowCount = if (sujoodCount % 2 == 0 && !nightState.isPartEnd) {
-                            nightState.rakatNumberInPart + 1
-                        } else {
-                            nightState.rakatNumberInPart
-                        }
-                        val downArrowCount = if (sujoodCount % 2 == 0 && !nightState.isPartEnd) {
-                            1
-                        } else {
-                            nightState.sujoodNumberInRakat
-                        }
-                        val sujoodText = if (downArrowCount == 1) "سجده اول" else "سجده دوم"
-
+                    DisplayMode.RAKAT_ONLY -> {
                         Column(
                             horizontalAlignment = Alignment.CenterHorizontally,
                             verticalArrangement = Arrangement.Center
                         ) {
-                            Text(
-                                text = nightState.prayerName,
-                                color = GoldSoft,
-                                fontSize = 20.sp,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(bottom = 4.dp)
-                            )
+                            if (displayState.sectionTitle != null) {
+                                Text(
+                                    text = displayState.sectionTitle,
+                                    color = GoldSoft,
+                                    fontSize = 20.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(bottom = 4.dp)
+                                )
+                            }
 
                             Text(
-                                text = displayRakatLabel,
+                                text = "رکعت ${ordinalPersian(displayState.rakatInSection)}",
                                 color = Color.White,
-                                fontSize = 24.sp,
+                                fontSize = 25.sp,
                                 fontWeight = FontWeight.Bold
                             )
-
-                            Spacer(modifier = Modifier.height(14.dp))
-
-                            ArrowRow(count = upArrowCount, pointingUp = true)
 
                             Spacer(modifier = Modifier.height(18.dp))
 
-                            ArrowRow(count = downArrowCount, pointingUp = false)
+                            RakatArrowRow(count = displayState.rakatInSection)
+
+                            if (selectedPrayer == PrayerType.NIGHT_PRAYER) {
+                                Spacer(modifier = Modifier.height(14.dp))
+                                Text(
+                                    text = "کل: رکعت ${displayState.totalRakatGlobal} از ۱۱",
+                                    color = Color.LightGray,
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+                    }
+
+                    DisplayMode.SUJOOD_FIRST, DisplayMode.SUJOOD_SECOND -> {
+                        val sujoodNum = if (displayState.mode == DisplayMode.SUJOOD_FIRST) 1 else 2
+                        val sujoodText = if (sujoodNum == 1) "سجده اول" else "سجده دوم"
+
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center
+                        ) {
+                            if (displayState.sectionTitle != null) {
+                                Text(
+                                    text = displayState.sectionTitle,
+                                    color = GoldSoft,
+                                    fontSize = 20.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(bottom = 4.dp)
+                                )
+                            }
+
+                            Text(
+                                text = "رکعت ${ordinalPersian(displayState.rakatInSection)}",
+                                color = Color.White,
+                                fontSize = 24.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+
+                            Spacer(modifier = Modifier.height(14.dp))
+
+                            RakatArrowRow(count = displayState.rakatInSection)
+
+                            Spacer(modifier = Modifier.height(18.dp))
+
+                            SujoodTriangleRow(count = sujoodNum)
 
                             Spacer(modifier = Modifier.height(14.dp))
 
@@ -643,53 +801,14 @@ fun RakatCounterApp() {
                                 fontWeight = FontWeight.Bold
                             )
 
-                            Spacer(modifier = Modifier.height(6.dp))
-
-                            Text(
-                                text = "کل: رکعت ${nightState.totalRakatNumber} از ۱۱",
-                                color = Color.LightGray,
-                                fontSize = 12.sp
-                            )
-                        }
-                    }
-
-                    else -> {
-                        val arrowRakat = if (sujoodCount % 2 == 0) {
-                            (completedRakats + 1).coerceAtMost(selectedPrayer.totalRakats)
-                        } else {
-                            currentRakat
-                        }
-                        val arrowSujood = if (sujoodCount % 2 == 0) 1 else currentSujoodStepInRakat
-                        val rakatText = "رکعت ${ordinalPersian(arrowRakat)}"
-                        val sujoodText = if (arrowSujood == 1) "سجده اول" else "سجده دوم"
-
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center
-                        ) {
-                            Text(
-                                text = rakatText,
-                                color = Color.White,
-                                fontSize = 25.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-
-                            Spacer(modifier = Modifier.height(16.dp))
-
-                            ArrowRow(count = arrowRakat, pointingUp = true)
-
-                            Spacer(modifier = Modifier.height(20.dp))
-
-                            ArrowRow(count = arrowSujood, pointingUp = false)
-
-                            Spacer(modifier = Modifier.height(16.dp))
-
-                            Text(
-                                text = sujoodText,
-                                color = Color.White,
-                                fontSize = 25.sp,
-                                fontWeight = FontWeight.Bold
-                            )
+                            if (selectedPrayer == PrayerType.NIGHT_PRAYER) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = "کل: رکعت ${displayState.totalRakatGlobal} از ۱۱",
+                                    color = Color.LightGray,
+                                    fontSize = 12.sp
+                                )
+                            }
                         }
                     }
                 }
@@ -729,8 +848,7 @@ fun RakatCounterApp() {
                         )
                         .clickable {
                             selectedPrayer = prayer
-                            sujoodCount = 0
-                            lastCountSource = "هنوز ثبت نشده"
+                            resetPrayerState()
                             nearAlreadyCounted.set(false)
                         }
                 ) {
@@ -757,7 +875,7 @@ fun RakatCounterApp() {
                 .padding(vertical = 8.dp, horizontal = 10.dp)
         ) {
             Text(
-                text = "با نزدیک شدن به سنسور یا لمس ثبت دستی، رکعت و سجده ثبت می‌شود.",
+                text = "بدون تشهد/سلام: ${noTashahhudSeconds}s • با تشهد/سلام: ${withTashahhudSeconds}s",
                 color = Color.LightGray,
                 fontSize = 12.sp,
                 textAlign = TextAlign.Center
@@ -775,7 +893,9 @@ fun RakatCounterApp() {
                 onClick = {
                     if (!isPrayerFinished) {
                         sujoodCount = (sujoodCount + 1).coerceAtMost(maxSujood)
+                        autoAdvancedRakat = 0
                         lastCountSource = "ثبت دستی"
+                        playKeyboardClick()
                     }
                 },
                 border = BorderStroke(1.dp, GoldAccent),
@@ -786,7 +906,9 @@ fun RakatCounterApp() {
 
             OutlinedButton(
                 onClick = {
-                    if (sujoodCount > 0) {
+                    if (autoAdvancedRakat > 0) {
+                        autoAdvancedRakat = 0
+                    } else if (sujoodCount > 0) {
                         sujoodCount--
                         nearAlreadyCounted.set(false)
                     }
@@ -799,8 +921,7 @@ fun RakatCounterApp() {
 
             Button(
                 onClick = {
-                    sujoodCount = 0
-                    lastCountSource = "هنوز ثبت نشده"
+                    resetPrayerState()
                     nearAlreadyCounted.set(false)
                     lastCountTime.set(0L)
                 },
@@ -859,6 +980,133 @@ fun RakatCounterApp() {
 }
 
 @Composable
+private fun TimingSettingsDialog(
+    initialNoTashahhud: Int,
+    initialWithTashahhud: Int,
+    onDismiss: () -> Unit,
+    onSave: (Int, Int) -> Unit
+) {
+    var noTashahhud by remember(initialNoTashahhud) {
+        mutableIntStateOf(initialNoTashahhud)
+    }
+    var withTashahhud by remember(initialWithTashahhud) {
+        mutableIntStateOf(initialWithTashahhud)
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            colors = CardDefaults.cardColors(containerColor = CardDark),
+            border = BorderStroke(1.dp, GoldAccent),
+            shape = RoundedCornerShape(10.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = "تنظیمات زمان پس از سجده دوم",
+                    color = GoldSoft,
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // زمان رکعت بدون تشهد یا سلام
+                Text(
+                    text = "رکعت بدون تشهد یا سلام: $noTashahhud ثانیه",
+                    color = Color.White,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = { if (noTashahhud > 1) noTashahhud-- },
+                        border = BorderStroke(1.dp, GoldAccent)
+                    ) {
+                        Text("-", color = Color.White, fontSize = 18.sp)
+                    }
+                    Text(
+                        text = "$noTashahhud s",
+                        color = GoldSoft,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    OutlinedButton(
+                        onClick = { if (noTashahhud < 60) noTashahhud++ },
+                        border = BorderStroke(1.dp, GoldAccent)
+                    ) {
+                        Text("+", color = Color.White, fontSize = 18.sp)
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // زمان رکعت با تشهد یا سلام
+                Text(
+                    text = "رکعت دارای تشهد یا سلام: $withTashahhud ثانیه",
+                    color = Color.White,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = { if (withTashahhud > 1) withTashahhud-- },
+                        border = BorderStroke(1.dp, GoldAccent)
+                    ) {
+                        Text("-", color = Color.White, fontSize = 18.sp)
+                    }
+                    Text(
+                        text = "$withTashahhud s",
+                        color = GoldSoft,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    OutlinedButton(
+                        onClick = { if (withTashahhud < 120) withTashahhud++ },
+                        border = BorderStroke(1.dp, GoldAccent)
+                    ) {
+                        Text("+", color = Color.White, fontSize = 18.sp)
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(20.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onDismiss,
+                        border = BorderStroke(1.dp, Color.Gray),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("لغو", color = Color.LightGray)
+                    }
+
+                    Button(
+                        onClick = { onSave(noTashahhud, withTashahhud) },
+                        colors = ButtonDefaults.buttonColors(containerColor = GoldAccent),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("ذخیره", color = PureBlack, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun MehrabGoldFrame(modifier: Modifier = Modifier) {
     Canvas(modifier = modifier) {
         val w = size.width
@@ -900,60 +1148,68 @@ private fun MehrabGoldFrame(modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun ArrowRow(count: Int, pointingUp: Boolean) {
+private fun RakatArrowRow(count: Int) {
     val safeCount = count.coerceIn(1, 4)
     Row(
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         repeat(safeCount) {
-            SingleArrowIcon(pointingUp = pointingUp)
+            RakatUpArrowIcon()
         }
     }
 }
 
 @Composable
-private fun SingleArrowIcon(pointingUp: Boolean) {
+private fun RakatUpArrowIcon() {
     Canvas(modifier = Modifier.size(width = 24.dp, height = 44.dp)) {
         val w = size.width
         val h = size.height
         val cx = w / 2f
+        val headH = h * 0.34f
+        val shaftTop = headH * 0.85f
+        val shaftWidth = w * 0.28f
 
-        if (pointingUp) {
-            val headH = h * 0.34f
-            val shaftTop = headH * 0.85f
-            val shaftWidth = w * 0.28f
-
-            drawRect(
-                color = Color.White,
-                topLeft = Offset(cx - shaftWidth / 2f, shaftTop),
-                size = androidx.compose.ui.geometry.Size(shaftWidth, h - shaftTop)
-            )
-            val head = Path().apply {
-                moveTo(cx, 0f)
-                lineTo(w * 0.92f, headH)
-                lineTo(w * 0.08f, headH)
-                close()
-            }
-            drawPath(path = head, color = Color.White)
-        } else {
-            val headH = h * 0.34f
-            val shaftBottom = h - headH * 0.85f
-            val shaftWidth = w * 0.28f
-
-            drawRect(
-                color = Color.White,
-                topLeft = Offset(cx - shaftWidth / 2f, 0f),
-                size = androidx.compose.ui.geometry.Size(shaftWidth, shaftBottom)
-            )
-            val head = Path().apply {
-                moveTo(cx, h)
-                lineTo(w * 0.92f, h - headH)
-                lineTo(w * 0.08f, h - headH)
-                close()
-            }
-            drawPath(path = head, color = Color.White)
+        drawRect(
+            color = Color.White,
+            topLeft = Offset(cx - shaftWidth / 2f, shaftTop),
+            size = Size(shaftWidth, h - shaftTop)
+        )
+        val head = Path().apply {
+            moveTo(cx, 0f)
+            lineTo(w * 0.92f, headH)
+            lineTo(w * 0.08f, headH)
+            close()
         }
+        drawPath(path = head, color = Color.White)
+    }
+}
+
+@Composable
+private fun SujoodTriangleRow(count: Int) {
+    val safeCount = count.coerceIn(1, 2)
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        repeat(safeCount) {
+            SujoodDownTriangleIcon()
+        }
+    }
+}
+
+@Composable
+private fun SujoodDownTriangleIcon() {
+    Canvas(modifier = Modifier.size(width = 28.dp, height = 24.dp)) {
+        val w = size.width
+        val h = size.height
+        val triangle = Path().apply {
+            moveTo(0f, 0f)
+            lineTo(w, 0f)
+            lineTo(w / 2f, h)
+            close()
+        }
+        drawPath(path = triangle, color = Color.White)
     }
 }
 
